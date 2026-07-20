@@ -1,1 +1,2 @@
 requests>=2.31
+yfinance>=1.5

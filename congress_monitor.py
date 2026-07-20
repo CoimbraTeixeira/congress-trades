@@ -1,47 +1,27 @@
 #!/usr/bin/env python3
-"""Monitor new House PTR (Periodic Transaction Report) filings and post them to Slack.
-
-Data source: the House Clerk's public bulk disclosure archive
-(disclosures-clerk.house.gov). No auth, no bot-blocking, ToS-safe.
-Covers House only -- the Senate's eFD site prohibits bulk/automated access.
-"""
+"""Monitor new House PTR (Periodic Transaction Report) filings and post them to Slack."""
 
 import argparse
 import json
-import re
-import subprocess
 import sys
-import tempfile
-import zipfile
 from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
 
 import requests
 
+from house_disclosures import (
+    PDF_URL_TMPL,
+    PTR_FILING_TYPE,
+    fetch_index,
+    fetch_ptr_text,
+    format_filer_name,
+    is_late_filing,
+    parse_transactions,
+)
+
 REPO_DIR = Path(__file__).resolve().parent
 STATE_PATH = REPO_DIR / "state" / "seen_docids.json"
 CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # webhook shared with fare-monitor
-
-HEADERS = {"User-Agent": "congress-trade-monitor/1.0"}
-INDEX_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
-PDF_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
-PTR_FILING_TYPE = "P"
-
-# Matches the first line of a transaction row in `pdftotext -layout` output, e.g.:
-#   SP   Intuit Inc. - Common Stock (INTU)   S   06/10/2026 07/07/2026   $15,001 -
-LINE1_RE = re.compile(
-    r"^\s*(?:(?P<owner>SP|DC|JT)\s+)?"
-    r"(?P<asset>.+?)\s+"
-    r"(?P<ttype>[PSE])\s+"
-    r"(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<notif_date>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<amt_start>\$[\d,]+)\s*-?\s*$"
-)
-# Matches the continuation line with the asset-type code and the range's upper bound, e.g.:
-#   [ST]   $50,000
-LINE2_RE = re.compile(r"^\s*\[(?P<asset_type>[A-Z]{1,3})\].*?(?P<amt_end>\$[\d,]+)\s*$")
-TICKER_RE = re.compile(r"\(([A-Z]{1,5})\)\s*$")
 
 
 def load_webhook_url() -> str:
@@ -63,82 +43,6 @@ def load_seen_doc_ids() -> set[str]:
 def save_seen_doc_ids(doc_ids: set[str]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(sorted(doc_ids)))
-
-
-def fetch_index(year: int) -> list[dict]:
-    resp = requests.get(INDEX_URL_TMPL.format(year=year), headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
-        txt_name = next(n for n in zf.namelist() if n.endswith(".txt"))
-        raw = zf.read(txt_name).decode("utf-8", errors="replace")
-
-    lines = raw.splitlines()
-    header = lines[0].split("\t")
-    rows = []
-    for line in lines[1:]:
-        if not line.strip():
-            continue
-        fields = line.split("\t")
-        if len(fields) != len(header):
-            continue
-        rows.append(dict(zip(header, fields)))
-    return rows
-
-
-def fetch_ptr_text(year: int, doc_id: str) -> str | None:
-    resp = requests.get(PDF_URL_TMPL.format(year=year, doc_id=doc_id), headers=HEADERS, timeout=30)
-    if resp.status_code != 200 or not resp.content:
-        return None
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
-        f.write(resp.content)
-        f.flush()
-        result = subprocess.run(
-            ["pdftotext", "-layout", f.name, "-"],
-            capture_output=True, text=True, timeout=30,
-        )
-    return result.stdout if result.returncode == 0 else None
-
-
-def parse_transactions(pdf_text: str) -> list[dict]:
-    """Best-effort extraction of transaction rows. Returns [] on any parsing trouble --
-    the caller still alerts using the index metadata alone."""
-    transactions = []
-    lines = pdf_text.splitlines()
-    for i, line in enumerate(lines):
-        m1 = LINE1_RE.match(line)
-        if not m1:
-            continue
-        amount = m1.group("amt_start")
-        # The upper bound of the range usually lands on the very next line.
-        if i + 1 < len(lines):
-            m2 = LINE2_RE.match(lines[i + 1])
-            if m2:
-                amount = f"{m1.group('amt_start')} - {m2.group('amt_end')}"
-        ticker_match = TICKER_RE.search(m1.group("asset"))
-        transactions.append({
-            "owner": m1.group("owner") or "self",
-            "asset": m1.group("asset").strip(),
-            "ticker": ticker_match.group(1) if ticker_match else None,
-            "type": {"P": "Purchase", "S": "Sale", "E": "Exchange"}.get(m1.group("ttype"), m1.group("ttype")),
-            "txn_date": m1.group("txn_date"),
-            "notif_date": m1.group("notif_date"),
-            "amount": amount,
-        })
-    return transactions
-
-
-def is_late_filing(txn_date: str, notif_date: str) -> bool:
-    try:
-        t = datetime.strptime(txn_date, "%m/%d/%Y")
-        n = datetime.strptime(notif_date, "%m/%d/%Y")
-    except ValueError:
-        return False
-    return (n - t).days > 45
-
-
-def format_filer_name(row: dict) -> str:
-    parts = [row.get("Prefix", ""), row.get("First", ""), row.get("Last", ""), row.get("Suffix", "")]
-    return " ".join(p for p in parts if p).strip()
 
 
 def build_message(row: dict, transactions: list[dict]) -> str:
@@ -206,7 +110,7 @@ def main() -> None:
         try:
             pdf_text = fetch_ptr_text(year, doc_id)
             transactions = parse_transactions(pdf_text) if pdf_text else []
-        except (requests.RequestException, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             print(f"[{now.isoformat()}] Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
 
