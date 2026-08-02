@@ -11,10 +11,12 @@ from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
     describe_asset,
-    fetch_index,
+    fetch_index_years,
     fetch_ptr_text,
     filing_delay_days,
+    filing_sort_key,
     format_filer_name,
+    index_years,
     is_late_filing,
     parse_transactions,
 )
@@ -64,17 +66,21 @@ def main() -> None:
     args = parser.parse_args()
 
     webhook_url = None if args.dry_run else load_webhook_url()
-    year = datetime.now(timezone.utc).year
+    years = index_years(datetime.now(timezone.utc))
 
-    rows = fetch_index(year)
-    ptr_rows = [r for r in rows if r.get("FilingType") == PTR_FILING_TYPE]
+    rows = fetch_index_years(years)
+    ptr_rows = sorted(
+        (r for r in rows if r.get("FilingType") == PTR_FILING_TYPE), key=filing_sort_key
+    )
     if args.verbose:
-        print(f"-- {len(rows)} total filings, {len(ptr_rows)} PTRs for {year} --")
+        years_label = ", ".join(str(y) for y in years)
+        print(f"-- {len(rows)} total filings, {len(ptr_rows)} PTRs for {years_label} --")
 
     if not STATE_PATH.exists():
         # Baseline run: record everything that already exists without alerting on the
         # historical backlog. Only filings that show up in future runs are new.
-        seed_baseline(STATE_PATH, {r["DocID"] for r in ptr_rows}, f"PTR(s) for {year}")
+        seed_baseline(STATE_PATH, {r["DocID"] for r in ptr_rows},
+                      f"PTR(s) for {', '.join(str(y) for y in years)}")
         return
 
     seen = load_seen_doc_ids(STATE_PATH)

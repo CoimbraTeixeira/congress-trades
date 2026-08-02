@@ -27,6 +27,9 @@ PTR_FILING_TYPE = "P"
 # Filers must report within 45 days of the transaction (STOCK Act, 5 U.S.C. app. 101).
 LATE_FILING_DAYS = 45
 
+# How far into a new year to keep reading the previous year's index (see index_years).
+INDEX_OVERLAP_DAYS = 60
+
 # House asset-type codes (fd.house.gov/reference/asset-type-codes.aspx) that denote
 # something with a US equity ticker. Everything else -- GS (government securities),
 # CT (crypto), OT (other funds), HN (hedge notes) -- must not be fed to the
@@ -182,6 +185,38 @@ def fetch_index(year: int) -> list[dict]:
         print(f"warning: skipped {malformed} malformed row(s) in the {year} index",
               file=sys.stderr)
     return rows
+
+
+def index_years(now: datetime) -> list[int]:
+    """Index years still worth fetching. Each year is a separate archive, so a PTR
+    filed on Dec 30 stays in that year's file -- a monitor that only ever reads the
+    current year goes blind to it the moment the calendar rolls over. Keep the
+    previous year in scope until this year's filings are well clear of the boundary."""
+    years = [now.year]
+    if now.timetuple().tm_yday <= INDEX_OVERLAP_DAYS:
+        years.append(now.year - 1)
+    return years
+
+
+def fetch_index_years(years: list[int]) -> list[dict]:
+    """Merge several years of index rows, first occurrence of a DocID winning."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for year in years:
+        for row in fetch_index(year):
+            doc_id = row.get("DocID", "")
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                rows.append(row)
+    return rows
+
+
+def filing_sort_key(row: dict) -> tuple:
+    """Order index rows oldest-first by filing date, DocID breaking ties. The archive's
+    own row order is not chronological, so without this an --max-alerts truncation
+    would keep an arbitrary slice rather than the oldest part of the backlog."""
+    filed = parse_date(row.get("FilingDate", ""))
+    return (filed or datetime.max, row.get("DocID", ""))
 
 
 def fetch_ptr_text(year: int | str, doc_id: str) -> str | None:

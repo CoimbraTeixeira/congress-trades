@@ -4,6 +4,8 @@ state/
 *.corrupt
 monitor.log
 watchlist_monitor.log
+summary.log
+rebuild.log
 leaderboard.json
 dashboard.html
 watchlist.json

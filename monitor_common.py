@@ -8,6 +8,8 @@ from pathlib import Path
 
 import requests
 
+from house_disclosures import member_key, parse_date
+
 REPO_DIR = Path(__file__).resolve().parent
 STATE_DIR = REPO_DIR / "state"
 CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # shared with fare-monitor
@@ -16,6 +18,11 @@ CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # shared
 # problem rather than a real burst of filings. The excess is left unseen so the next
 # run picks it up, rather than being silently dropped.
 DEFAULT_MAX_ALERTS = 25
+
+# When a member joins a watched set, their existing filings are baselined away rather
+# than replayed -- but a just-promoted member's trade from a few days ago is exactly the
+# signal we're watching for. Filings this recent stay alertable.
+DEFAULT_BASELINE_WINDOW_DAYS = 7
 
 
 def log(message: str) -> None:
@@ -65,10 +72,12 @@ def write_json(path: Path, payload) -> None:
 
 
 def load_watch_state(path: Path) -> tuple[set[str], set[tuple]]:
-    """Seen DocIDs plus the members already baselined.
+    """Seen DocIDs plus the watchlist membership as of the last run.
 
-    Tracking baselined members separately is what stops a watchlist rotation from
-    replaying a newly promoted member's entire back catalogue as fresh alerts.
+    Recording who was watched is what stops a watchlist rotation from replaying a newly
+    promoted member's entire back catalogue as fresh alerts. It is last run's membership
+    rather than a growing union, so a member who drops off and returns is baselined again
+    instead of replaying their absence.
     Tolerates the legacy bare-list format (all DocIDs, no member record)."""
     if not path.exists():
         return set(), set()
@@ -91,6 +100,27 @@ def save_watch_state(path: Path, seen: set[str], baselined: set[tuple]) -> None:
         "seen": sorted(seen),
         "baselined_members": sorted(list(m) for m in baselined),
     })
+
+
+def is_within_window(row: dict, now: datetime, window_days: int) -> bool:
+    """True if the filing is recent enough to alert on despite its member being new to
+    the watched set. An unparseable filing date is treated as old -- baselining something
+    stale is a missed alert, but replaying a whole back catalogue is a pager storm."""
+    filed = parse_date(row.get("FilingDate", ""))
+    return filed is not None and (now.replace(tzinfo=None) - filed).days <= window_days
+
+
+def baseline_docids(rows: list[dict], members: set[tuple], now: datetime,
+                    window_days: int, apply_window: bool = True) -> set[str]:
+    """DocIDs to record as seen *without* alerting, for members new to a watched set.
+
+    `apply_window=False` on a first-ever run, where there is no prior membership to
+    compare against and the whole back catalogue should go quiet."""
+    return {
+        row["DocID"] for row in rows
+        if member_key(row) in members
+        and not (apply_window and is_within_window(row, now, window_days))
+    }
 
 
 def send_slack_message(webhook_url: str, text: str) -> None:
