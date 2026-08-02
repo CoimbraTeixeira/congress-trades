@@ -6,33 +6,95 @@ Covers House only -- the Senate's eFD site prohibits bulk/automated access.
 """
 
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import zipfile
 from datetime import datetime
 from io import BytesIO
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 HEADERS = {"User-Agent": "congress-trade-monitor/1.0"}
 INDEX_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
 PDF_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
 PTR_FILING_TYPE = "P"
 
-# Matches the first line of a transaction row in `pdftotext -layout` output, e.g.:
-#   SP   Intuit Inc. - Common Stock (INTU)   S   06/10/2026 07/07/2026   $15,001 -
-LINE1_RE = re.compile(
-    r"^\s*(?:(?P<owner>SP|DC|JT)\s+)?"
-    r"(?P<asset>.+?)\s+"
-    r"(?P<ttype>[PSE])\s+"
-    r"(?P<txn_date>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<notif_date>\d{2}/\d{2}/\d{4})\s+"
-    r"(?P<amt_start>\$[\d,]+)\s*-?\s*$"
+# Filers must report within 45 days of the transaction (STOCK Act, 5 U.S.C. app. 101).
+LATE_FILING_DAYS = 45
+
+# House asset-type codes (fd.house.gov/reference/asset-type-codes.aspx) that denote
+# something with a US equity ticker. Everything else -- GS (government securities),
+# CT (crypto), OT (other funds), HN (hedge notes) -- must not be fed to the
+# company-name ticker lookup, which would happily match "US Treasury Note" to a stock.
+EQUITY_ASSET_TYPES = {"ST", "OP"}
+
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update(HEADERS)
+    return session
+
+
+_thread_local = threading.local()
+
+
+def _session() -> requests.Session:
+    """One session per thread -- build_leaderboard fetches PDFs from a thread pool and
+    a single Session's connection pool is not safe to share across them."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = _make_session()
+        _thread_local.session = session
+    return session
+
+# --- Transaction table parsing -------------------------------------------------
+#
+# `pdftotext -layout` renders each transaction as a block whose first line carries
+# the transaction type and the two dates, e.g.:
+#
+#     SP    American Water Works Company,     S    01/14/2026 02/04/2026    $50,001 -
+#           Inc. Common Stock (AWK) [ST]                                    $100,000
+#
+# The asset name, its ticker, its asset-type code and the range's upper bound all
+# routinely wrap onto continuation lines, so a transaction has to be read as a
+# block rather than a line. The date pair is the only reliably positioned anchor.
+
+DATE_PAIR_RE = re.compile(
+    r"(?P<txn_date>\d{1,2}/\d{1,2}/\d{4})\s+(?P<notif_date>\d{1,2}/\d{1,2}/\d{4})"
 )
-# Matches the continuation line with the asset-type code and the range's upper bound, e.g.:
-#   [ST]   $50,000
-LINE2_RE = re.compile(r"^\s*\[(?P<asset_type>[A-Z]{1,3})\].*?(?P<amt_end>\$[\d,]+)\s*$")
-TICKER_RE = re.compile(r"\(([A-Z]{1,5})\)")
+# Everything left of the dates: optional row id, optional owner code, asset, type.
+HEAD_RE = re.compile(
+    r"^\s*(?:\d+\s+)?"
+    r"(?:(?P<owner>SP|DC|JT)\s+)?"
+    r"(?P<asset>.*?)\s+"
+    r"(?P<ttype>[PSE])(?P<partial>\s*\(partial\))?\s*$"
+)
+ASSET_TYPE_RE = re.compile(r"\[(?P<code>[A-Z]{2})\]")
+AMOUNT_TOKEN_RE = re.compile(r"\$[\d,]+")
+# Sub-field lines below a transaction ("Filing Status: New", "Subholding Of: ...").
+# pdftotext drops the small-caps labels, leaving a stray letter before the colon.
+FIELD_LINE_RE = re.compile(r"^\s*\S.{0,40}?\s:\s")
+TICKER_RE = re.compile(r"\(([A-Z]{1,5}(?:[.\-][A-Z]{1,2})?)\)")
+MAX_CONTINUATION_LINES = 4
+
+TXN_TYPES = {"P": "Purchase", "S": "Sale", "E": "Exchange"}
+
+_HEADER_TOKENS = {
+    "id", "owner", "asset", "transaction", "type", "notification", "date",
+    "amount", "cap.", "gains", ">", "$200?", "filing", "#",
+}
 
 AMOUNT_RANGE_RE = re.compile(r"\$([\d,]+)\s*-\s*\$([\d,]+)")
 AMOUNT_SINGLE_RE = re.compile(r"\$([\d,]+)")
@@ -43,6 +105,7 @@ _NAME_CLEAN_PATTERNS = [
     (re.compile(r"\bCommon\b\.?", re.I), " "),
     (re.compile(r"\bClass [A-Z]\b.*$", re.I), " "),
     (re.compile(r"\bOrdinary Shares\b", re.I), " "),
+    (re.compile(r"\([A-Z]{1,5}(?:[.\-][A-Z]{1,2})?\)"), " "),
 ]
 _ticker_by_name_cache: dict[str, str | None] = {}
 
@@ -50,21 +113,24 @@ _ticker_by_name_cache: dict[str, str | None] = {}
 def clean_asset_name(name: str) -> str:
     for pattern, repl in _NAME_CLEAN_PATTERNS:
         name = pattern.sub(repl, name)
-    return name.strip(" ,.")
+    return re.sub(r"\s+", " ", name).strip(" ,.-")
 
 
 def resolve_ticker_by_name(asset_name: str) -> str | None:
     """Best-effort company-name -> US equity ticker lookup via Yahoo's search endpoint.
-    Used as a fallback when the disclosure doesn't print a ticker in parens (common --
-    many filers just write the company name). Bonds/funds/etc. correctly resolve to
-    nothing. Results are cached in-process since the same names repeat across filings."""
+    Used as a fallback when the disclosure doesn't print a ticker in parens. Callers
+    must gate this on an equity asset type -- the endpoint returns a best match for
+    anything, so a bond or fund name would silently resolve to an unrelated stock.
+    Results are cached in-process since the same names repeat across filings."""
     cleaned = clean_asset_name(asset_name)
+    if not cleaned:
+        return None
     if cleaned in _ticker_by_name_cache:
         return _ticker_by_name_cache[cleaned]
 
     ticker = None
     try:
-        resp = requests.get(
+        resp = _session().get(
             "https://query1.finance.yahoo.com/v1/finance/search",
             params={"q": cleaned, "quotesCount": 5, "newsCount": 0},
             headers={"User-Agent": "Mozilla/5.0"},
@@ -83,8 +149,18 @@ def resolve_ticker_by_name(asset_name: str) -> str | None:
     return ticker
 
 
+def resolve_ticker(txn: dict) -> str | None:
+    """Ticker for a parsed transaction: the one printed in the filing if present,
+    otherwise a name lookup -- but only for asset types that are actually equities."""
+    if txn.get("ticker"):
+        return txn["ticker"]
+    if txn.get("asset_type") not in EQUITY_ASSET_TYPES:
+        return None
+    return resolve_ticker_by_name(txn["asset"])
+
+
 def fetch_index(year: int) -> list[dict]:
-    resp = requests.get(INDEX_URL_TMPL.format(year=year), headers=HEADERS, timeout=30)
+    resp = _session().get(INDEX_URL_TMPL.format(year=year), timeout=30)
     resp.raise_for_status()
     with zipfile.ZipFile(BytesIO(resp.content)) as zf:
         txt_name = next(n for n in zf.namelist() if n.endswith(".txt"))
@@ -93,18 +169,25 @@ def fetch_index(year: int) -> list[dict]:
     lines = raw.splitlines()
     header = lines[0].split("\t")
     rows = []
+    malformed = 0
     for line in lines[1:]:
         if not line.strip():
             continue
         fields = line.split("\t")
         if len(fields) != len(header):
+            malformed += 1
             continue
         rows.append(dict(zip(header, fields)))
+    if malformed:
+        print(f"warning: skipped {malformed} malformed row(s) in the {year} index",
+              file=sys.stderr)
     return rows
 
 
-def fetch_ptr_text(year: int, doc_id: str) -> str | None:
-    resp = requests.get(PDF_URL_TMPL.format(year=year, doc_id=doc_id), headers=HEADERS, timeout=30)
+def fetch_ptr_text(year: int | str, doc_id: str) -> str | None:
+    if shutil.which("pdftotext") is None:
+        sys.exit("pdftotext not found -- install poppler-utils (apt install poppler-utils)")
+    resp = _session().get(PDF_URL_TMPL.format(year=year, doc_id=doc_id), timeout=30)
     if resp.status_code != 200 or not resp.content:
         return None
     with tempfile.NamedTemporaryFile(suffix=".pdf") as f:
@@ -117,37 +200,115 @@ def fetch_ptr_text(year: int, doc_id: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def parse_transactions(pdf_text: str) -> list[dict]:
-    """Best-effort extraction of transaction rows. Returns [] on any parsing trouble --
-    callers should fall back to the index metadata alone (e.g. name/date/PDF link)."""
-    transactions = []
-    lines = pdf_text.splitlines()
-    for i, line in enumerate(lines):
-        m1 = LINE1_RE.match(line)
-        if not m1:
+def _is_page_furniture(line: str) -> bool:
+    tokens = line.split()
+    if not tokens:
+        return False
+    if tokens[0] == "Clerk" or line.lstrip().startswith("* For the complete list"):
+        return True
+    return all(t.lower() in _HEADER_TOKENS or t.lower().startswith("#2") for t in tokens)
+
+
+def _strip_page_furniture(lines: list[str]) -> list[str]:
+    """Drop the transaction-table header that pdftotext repeats at the top of every page,
+    along with the blank padding around it.
+
+    A page break lands mid-transaction often enough to matter: without this the record is
+    read as ending at the page's trailing blank line, losing its ticker, its asset-type
+    code and the upper bound of its amount range. (str.splitlines already swallows the
+    form feed itself, so the repeated header is the only marker left to key off.)"""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if _is_page_furniture(lines[i]):
+            while out and not out[-1].strip():
+                out.pop()  # blank padding belonging to the page break, not the record
+            while i < len(lines) and (not lines[i].strip() or _is_page_furniture(lines[i])):
+                i += 1
             continue
-        amount = m1.group("amt_start")
-        # The upper bound of the range usually lands on the very next line.
-        if i + 1 < len(lines):
-            m2 = LINE2_RE.match(lines[i + 1])
-            if m2:
-                amount = f"{m1.group('amt_start')} - {m2.group('amt_end')}"
-        ticker_match = TICKER_RE.search(m1.group("asset"))
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+def parse_transactions(pdf_text: str) -> list[dict]:
+    """Extract transaction rows from `pdftotext -layout` output of a PTR.
+
+    Returns [] for filings with no parseable transaction table -- callers should fall
+    back to the index metadata alone (e.g. name/date/PDF link)."""
+    lines = _strip_page_furniture(pdf_text.splitlines())
+    transactions = []
+    i = 0
+    while i < len(lines):
+        dates = DATE_PAIR_RE.search(lines[i])
+        if not dates:
+            i += 1
+            continue
+        head = HEAD_RE.match(lines[i][: dates.start()])
+        if not head:
+            i += 1
+            continue
+
+        tail = lines[i][dates.end():]
+        asset_parts = [head.group("asset").strip()]
+        amounts = AMOUNT_TOKEN_RE.findall(tail)
+        over_cap = "+" in tail
+        code = ASSET_TYPE_RE.search(lines[i])
+        asset_type = code.group("code") if code else None
+
+        j = i + 1
+        consumed = 0
+        while j < len(lines) and consumed < MAX_CONTINUATION_LINES:
+            nxt = lines[j]
+            if not nxt.strip() or DATE_PAIR_RE.search(nxt) or FIELD_LINE_RE.match(nxt):
+                break
+            amounts += AMOUNT_TOKEN_RE.findall(nxt)
+            over_cap = over_cap or "+" in nxt
+            if asset_type is None:
+                code = ASSET_TYPE_RE.search(nxt)
+                if code:
+                    asset_type = code.group("code")
+            fragment = AMOUNT_TOKEN_RE.sub(" ", nxt).strip()
+            if fragment:
+                asset_parts.append(fragment)
+            j += 1
+            consumed += 1
+            if asset_type is not None and len(amounts) >= 2:
+                break
+
+        asset = re.sub(r"\s+", " ", " ".join(asset_parts))
+        asset = ASSET_TYPE_RE.sub("", asset).strip(" ,.")
+
+        if len(amounts) >= 2:
+            amount = f"{amounts[0]} - {amounts[1]}"
+        elif amounts and over_cap:
+            amount = f"{amounts[0]} +"
+        elif amounts:
+            amount = amounts[0]
+        else:
+            amount = ""
+
+        ticker = TICKER_RE.search(asset)
         transactions.append({
-            "owner": m1.group("owner") or "self",
-            "asset": m1.group("asset").strip(),
-            "ticker": ticker_match.group(1) if ticker_match else None,
-            "type": {"P": "Purchase", "S": "Sale", "E": "Exchange"}.get(m1.group("ttype"), m1.group("ttype")),
-            "txn_date": m1.group("txn_date"),
-            "notif_date": m1.group("notif_date"),
+            "owner": head.group("owner") or "self",
+            "asset": asset,
+            "asset_type": asset_type,
+            "ticker": ticker.group(1) if ticker else None,
+            "type": TXN_TYPES[head.group("ttype")],
+            "partial": bool(head.group("partial")),
+            "txn_date": dates.group("txn_date"),
+            "notif_date": dates.group("notif_date"),
             "amount": amount,
         })
+        i = max(j, i + 1)
     return transactions
 
 
 def amount_midpoint(amount: str) -> float | None:
-    """Convert a disclosed amount string ("$15,001 - $50,000" or "$1,001") to a
-    representative dollar figure -- the midpoint of the range, or the value itself."""
+    """Convert a disclosed amount string ("$15,001 - $50,000") to a representative
+    dollar figure -- the midpoint of the range. Open-ended top-bucket amounts
+    ("$1,000,001 +") and lone bounds fall back to the stated value, which
+    understates rather than overstates."""
     m = AMOUNT_RANGE_RE.search(amount)
     if m:
         lo = float(m.group(1).replace(",", ""))
@@ -159,15 +320,49 @@ def amount_midpoint(amount: str) -> float | None:
     return None
 
 
-def is_late_filing(txn_date: str, notif_date: str) -> bool:
+def parse_date(value: str) -> datetime | None:
     try:
-        t = datetime.strptime(txn_date, "%m/%d/%Y")
-        n = datetime.strptime(notif_date, "%m/%d/%Y")
-    except ValueError:
-        return False
-    return (n - t).days > 45
+        return datetime.strptime(value.strip(), "%m/%d/%Y")
+    except (ValueError, AttributeError):
+        return None
+
+
+def filing_delay_days(txn_date: str, filing_date: str) -> int | None:
+    """Days between the transaction and the day the report was actually filed."""
+    txn = parse_date(txn_date)
+    filed = parse_date(filing_date)
+    if txn is None or filed is None:
+        return None
+    return (filed - txn).days
+
+
+def is_late_filing(txn_date: str, filing_date: str) -> bool:
+    """True if the report was filed more than 45 days after the transaction.
+
+    Note this compares against the *filing* date from the index, not the
+    notification date printed in the PDF -- the notification date is when the filer's
+    broker told them about the trade, which says nothing about the filer's own delay.
+    """
+    delay = filing_delay_days(txn_date, filing_date)
+    return delay is not None and delay > LATE_FILING_DAYS
 
 
 def format_filer_name(row: dict) -> str:
     parts = [row.get("Prefix", ""), row.get("First", ""), row.get("Last", ""), row.get("Suffix", "")]
     return " ".join(p for p in parts if p).strip()
+
+
+def describe_asset(txn: dict) -> str:
+    """Display string for a transaction's asset. Most filings already print the ticker
+    in the asset name, so only append it when it isn't there -- otherwise the alert
+    reads "AT&T Inc. (T) (T)"."""
+    asset = txn.get("asset", "")
+    ticker = txn.get("ticker")
+    if ticker and f"({ticker})" not in asset:
+        return f"{asset} ({ticker})"
+    return asset
+
+
+def member_key(row: dict) -> tuple[str, str, str]:
+    """Stable identity for a filer across index rows -- raw fields, not display name."""
+    return (row.get("Last", ""), row.get("First", ""), row.get("StateDst", ""))

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 state/
+*.corrupt
 monitor.log
 watchlist_monitor.log
 leaderboard.json

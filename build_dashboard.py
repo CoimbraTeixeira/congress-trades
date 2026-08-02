@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Render leaderboard.json into a self-contained HTML dashboard artifact."""
+"""Render leaderboard.json into a self-contained HTML dashboard artifact.
+
+The template is injected via a single sentinel rather than str.format so that CSS
+and JS braces need no doubling -- the previous approach made every template edit a
+chance to break the page.
+"""
 
 import json
+import sys
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
 DATA_PATH = REPO_DIR / "leaderboard.json"
 OUTPUT_PATH = REPO_DIR / "dashboard.html"
+DATA_SENTINEL = "/*__LEADERBOARD_DATA__*/null"
 
 TEMPLATE = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Congress Stock Trading Leaderboard</title>
 <style>
-  :root {{
+  :root {
     color-scheme: light;
     --surface-1: #fcfcfb;
     --page: #f9f9f7;
@@ -25,9 +34,9 @@ TEMPLATE = """<!doctype html>
     --bad: #e34948;
     --good-bg: #cde2fb;
     --bad-bg: #fbdada;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root:where(:not([data-theme="light"])) {{
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
       color-scheme: dark;
       --surface-1: #1a1a19;
       --page: #0d0d0d;
@@ -41,9 +50,9 @@ TEMPLATE = """<!doctype html>
       --bad: #e66767;
       --good-bg: #143253;
       --bad-bg: #4a1f1f;
-    }}
-  }}
-  :root[data-theme="dark"] {{
+    }
+  }
+  :root[data-theme="dark"] {
     color-scheme: dark;
     --surface-1: #1a1a19;
     --page: #0d0d0d;
@@ -57,30 +66,30 @@ TEMPLATE = """<!doctype html>
     --bad: #e66767;
     --good-bg: #143253;
     --bad-bg: #4a1f1f;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
+  }
+  * { box-sizing: border-box; }
+  body {
     margin: 0;
     background: var(--page);
     color: var(--text-primary);
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     padding: 24px 16px 64px;
-  }}
-  .wrap {{ max-width: 900px; margin: 0 auto; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 4px; }}
-  .subtitle {{ color: var(--text-secondary); font-size: 0.9rem; margin: 0 0 20px; }}
-  .card {{
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { margin-top: 0; font-size: 1.05rem; }
+  .subtitle { color: var(--text-secondary); font-size: 0.9rem; margin: 0 0 20px; }
+  .card {
     background: var(--surface-1);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 20px;
     margin-bottom: 20px;
-  }}
-  .stat-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; }}
-  .stat-tile {{ }}
-  .stat-value {{ font-size: 1.6rem; font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .stat-label {{ color: var(--text-muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }}
-  .callout {{
+  }
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; }
+  .stat-value { font-size: 1.6rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat-label { color: var(--text-muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .callout {
     font-size: 0.85rem;
     color: var(--text-secondary);
     background: var(--surface-1);
@@ -90,76 +99,81 @@ TEMPLATE = """<!doctype html>
     padding: 14px 16px;
     margin-bottom: 20px;
     line-height: 1.5;
-  }}
-  .callout ul {{ margin: 8px 0 0; padding-left: 18px; }}
-  .bar-row {{ display: grid; grid-template-columns: 200px 1fr 90px; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--grid); }}
-  .bar-row:last-child {{ border-bottom: none; }}
-  .bar-name {{ font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .bar-name .dist {{ color: var(--text-muted); font-size: 0.75rem; }}
-  .bar-track {{ position: relative; height: 20px; background: var(--grid); border-radius: 3px; overflow: visible; }}
-  .bar-fill {{ position: absolute; top: 0; height: 100%; border-radius: 3px; }}
-  .bar-fill.good {{ background: var(--good); left: 50%; }}
-  .bar-fill.bad {{ background: var(--bad); right: 50%; }}
-  .bar-mid {{ position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--baseline); }}
-  .bar-pct {{ font-variant-numeric: tabular-nums; font-size: 0.85rem; text-align: right; }}
-  .bar-pct.good {{ color: var(--good); }}
-  .bar-pct.bad {{ color: var(--bad); }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }}
-  th {{ color: var(--text-muted); font-weight: 500; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.03em; cursor: pointer; user-select: none; }}
-  th:hover {{ color: var(--text-primary); }}
-  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .pill {{ display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78rem; font-variant-numeric: tabular-nums; }}
-  .pill.good {{ background: var(--good-bg); color: var(--good); }}
-  .pill.bad {{ background: var(--bad-bg); color: var(--bad); }}
-  details {{ margin-top: 2px; }}
-  details summary {{ cursor: pointer; color: var(--text-muted); font-size: 0.78rem; }}
-  .trade-list {{ margin: 6px 0 0; padding-left: 16px; font-size: 0.78rem; color: var(--text-secondary); }}
-  .table-wrap {{ overflow-x: auto; }}
-  .source-note {{ color: var(--text-muted); font-size: 0.75rem; margin-top: 24px; text-align: center; }}
+  }
+  .callout ul { margin: 8px 0 0; padding-left: 18px; }
+  .bar-row { display: grid; grid-template-columns: 200px 1fr 90px; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--grid); }
+  .bar-row:last-child { border-bottom: none; }
+  .bar-name { font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-name .dist { color: var(--text-muted); font-size: 0.75rem; }
+  .bar-track { position: relative; height: 20px; background: var(--grid); border-radius: 3px; }
+  .bar-fill { position: absolute; top: 0; height: 100%; }
+  /* Round only the data end; the baseline end stays square against the midline. */
+  .bar-fill.good { background: var(--good); left: 50%; border-radius: 0 4px 4px 0; }
+  .bar-fill.bad { background: var(--bad); right: 50%; border-radius: 4px 0 0 4px; }
+  .bar-mid { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--baseline); }
+  .bar-pct { font-variant-numeric: tabular-nums; font-size: 0.85rem; text-align: right; }
+  .bar-pct.good { color: var(--good); }
+  .bar-pct.bad { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { color: var(--text-muted); font-weight: 500; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.03em; cursor: pointer; user-select: none; }
+  th:hover, th:focus-visible { color: var(--text-primary); }
+  th[aria-sort]:not([aria-sort="none"]) { color: var(--text-primary); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.unranked td { color: var(--text-muted); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+  .pill.good { background: var(--good-bg); color: var(--good); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad); }
+  details { margin-top: 2px; }
+  details summary { cursor: pointer; color: var(--text-muted); font-size: 0.78rem; }
+  .trade-list { margin: 6px 0 0; padding-left: 16px; font-size: 0.78rem; color: var(--text-secondary); }
+  .table-wrap { overflow-x: auto; }
+  .source-note { color: var(--text-muted); font-size: 0.75rem; margin-top: 24px; text-align: center; }
+  .empty { color: var(--text-muted); font-size: 0.9rem; }
+  #tooltip {
+    position: fixed; z-index: 10; pointer-events: none; opacity: 0;
+    transition: opacity 90ms ease;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 0.78rem; line-height: 1.45;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18); max-width: 260px;
+  }
+  #tooltip .t-name { font-weight: 600; margin-bottom: 3px; }
+  #tooltip dl { display: grid; grid-template-columns: auto auto; gap: 1px 10px; margin: 0; }
+  #tooltip dt { color: var(--text-muted); }
+  #tooltip dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  @media (max-width: 560px) {
+    .bar-row { grid-template-columns: 120px 1fr 66px; }
+  }
 </style>
 <div class="wrap">
   <h1>Congress Stock Trading Leaderboard</h1>
-  <p class="subtitle">House members, {year} · estimated returns from disclosed Periodic Transaction Reports · generated {generated_at}</p>
+  <p class="subtitle" id="subtitle"></p>
 
-  <div class="callout">
-    <strong>How to read this.</strong> The STOCK Act requires disclosure of only a dollar <em>range</em>
-    (e.g. "$15,001-$50,000"), never an exact amount or share count. Figures here are estimates:
-    <ul>
-      <li>Each trade's dollar value is the <strong>midpoint</strong> of its disclosed range.</li>
-      <li><strong>Unrealized</strong> gains mark still-held positions to today's price — hypothetical, not cashed out.</li>
-      <li><strong>Realized</strong> gains only count buy/sell pairs matched within {year}; sales of positions opened before {year} have unknown cost basis and are excluded.</li>
-      <li>{priced_trades} of {total_trades} disclosed trade lines resolved to a priced ticker; the rest (bonds, treasury notes, private funds, or trades with no parseable ticker) count toward activity but not toward gain estimates.</li>
-      <li>Members can file up to 45 days after a trade — recent trades may not be reflected yet. House only; Senate disclosures aren't included.</li>
-    </ul>
+  <div class="callout" id="callout"></div>
+
+  <div class="card">
+    <div class="stat-row" id="stats"></div>
   </div>
 
   <div class="card">
-    <div class="stat-row">
-      <div class="stat-tile"><div class="stat-value">{n_priced}</div><div class="stat-label">Members with priced trades</div></div>
-      <div class="stat-tile"><div class="stat-value">{top_name_short}</div><div class="stat-label">Top estimated return</div></div>
-      <div class="stat-tile"><div class="stat-value">{top_pct:+.1f}%</div><div class="stat-label">{top_name}</div></div>
-      <div class="stat-tile"><div class="stat-value">{avg_pct:+.1f}%</div><div class="stat-label">Average return (priced members)</div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2 style="margin-top:0; font-size:1.05rem;">Top 10 by estimated return</h2>
+    <h2>Top 10 ranked members by estimated return</h2>
     <div id="chart"></div>
   </div>
 
   <div class="card">
-    <h2 style="margin-top:0; font-size:1.05rem;">All members with priced trades ({n_priced})</h2>
+    <h2 id="table-heading">All members with priced trades</h2>
     <div class="table-wrap">
       <table id="full-table">
         <thead>
           <tr>
-            <th data-key="member">Member</th>
-            <th data-key="state_dist">District</th>
-            <th class="num" data-key="total_trades">Trades</th>
-            <th class="num" data-key="invested_total_estimate">Est. Invested</th>
-            <th class="num" data-key="total_gain_estimate">Est. Gain</th>
-            <th class="num" data-key="return_pct_estimate">Return %</th>
+            <th data-key="member" tabindex="0" aria-sort="none">Member</th>
+            <th data-key="state_dist" tabindex="0" aria-sort="none">District</th>
+            <th class="num" data-key="priced_trades" tabindex="0" aria-sort="none">Priced Trades</th>
+            <th class="num" data-key="invested_total_estimate" tabindex="0" aria-sort="none">Est. Basis</th>
+            <th class="num" data-key="realized_gain_estimate" tabindex="0" aria-sort="none">Realized</th>
+            <th class="num" data-key="unrealized_gain_estimate" tabindex="0" aria-sort="none">Unrealized</th>
+            <th class="num" data-key="return_pct_estimate" tabindex="0" aria-sort="descending">Return %</th>
           </tr>
         </thead>
         <tbody id="full-table-body"></tbody>
@@ -169,73 +183,178 @@ TEMPLATE = """<!doctype html>
 
   <p class="source-note">Source: disclosures-clerk.house.gov public PTR filings · prices via Yahoo Finance · not investment advice</p>
 </div>
+<div id="tooltip" role="tooltip" aria-hidden="true"></div>
 
 <script>
-const DATA = {data_json};
+const DATA = /*__LEADERBOARD_DATA__*/null;
 
-function fmtMoney(v) {{
-  return '$' + Math.round(v).toLocaleString();
-}}
-function fmtPct(v) {{
-  return (v > 0 ? '+' : '') + v.toFixed(1) + '%';
-}}
+const MEMBERS = DATA.members || [];
+const RANKED = MEMBERS.filter(m => m.ranked);
+const PRICED = MEMBERS.filter(m => m.return_pct_estimate !== null);
+const TOTALS = DATA.totals || {};
 
-function renderChart() {{
-  const top10 = DATA.members
-    .filter(m => m.return_pct_estimate !== null)
-    .sort((a, b) => b.return_pct_estimate - a.return_pct_estimate)
-    .slice(0, 10);
-  const maxAbs = Math.max(...top10.map(m => Math.abs(m.return_pct_estimate)), 1);
+const esc = s => String(s).replace(/[&<>"']/g, c => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+const fmtMoney = v => (v < 0 ? '-$' : '$') + Math.round(Math.abs(v)).toLocaleString();
+const fmtSigned = v => (v >= 0 ? '+' : '-') + '$' + Math.round(Math.abs(v)).toLocaleString();
+const fmtPct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+
+function renderHeader() {
+  document.getElementById('subtitle').textContent =
+    `House members, ${DATA.year} · estimated returns from disclosed Periodic Transaction ` +
+    `Reports · generated ${String(DATA.generated_at).slice(0, 10)}`;
+
+  const minInvested = fmtMoney(DATA.min_invested || 0);
+  document.getElementById('callout').innerHTML = `
+    <strong>How to read this.</strong> The STOCK Act requires disclosure of only a dollar
+    <em>range</em> (e.g. "$15,001-$50,000"), never an exact amount or share count. Figures
+    here are estimates:
+    <ul>
+      <li>Each trade's dollar value is the <strong>midpoint</strong> of its disclosed range,
+          converted to estimated shares at that day's close. Buys and sells are FIFO-matched
+          in share space.</li>
+      <li><strong>Unrealized</strong> gains mark still-held shares to the latest close —
+          hypothetical, not cashed out.</li>
+      <li><strong>Realized</strong> gains only count buy/sell pairs matched within
+          ${esc(DATA.year)}; sales of positions opened earlier have unknown cost basis and
+          are excluded.</li>
+      <li>${esc(TOTALS.tradeable_lines ?? 0)} of ${esc(TOTALS.transaction_lines ?? 0)}
+          disclosed trade lines resolved to an equity ticker; the rest (treasuries, municipal
+          bonds, funds, crypto) count toward activity but not toward gain estimates.</li>
+      <li>Members are <strong>ranked</strong> only with at least ${esc(DATA.min_trades)} priced
+          trades and ${esc(minInvested)} estimated cost basis — otherwise one lucky trade
+          tops the board. Unranked members are shown greyed in the table.</li>
+      <li>Members can file up to 45 days after a trade — recent trades may not appear yet.
+          House only; Senate disclosures aren't included.</li>
+    </ul>`;
+
+  const avg = RANKED.length
+    ? RANKED.reduce((a, m) => a + m.return_pct_estimate, 0) / RANKED.length : 0;
+  const top = RANKED[0];
+  const tiles = [
+    [RANKED.length, 'Ranked members'],
+    [PRICED.length, 'Members with priced trades'],
+    [top ? fmtPct(top.return_pct_estimate) : '—',
+     top ? `Top: ${top.member} (${top.state_dist})` : 'Top estimated return'],
+    [RANKED.length ? fmtPct(avg) : '—', 'Average return (ranked)'],
+  ];
+  document.getElementById('stats').innerHTML = tiles.map(([v, l]) =>
+    `<div><div class="stat-value">${esc(v)}</div><div class="stat-label">${esc(l)}</div></div>`
+  ).join('');
+
+  document.getElementById('table-heading').textContent =
+    `All members with priced trades (${PRICED.length})`;
+}
+
+function renderChart() {
   const chart = document.getElementById('chart');
-  chart.innerHTML = top10.map(m => {{
+  const top10 = RANKED.slice(0, 10);
+  if (!top10.length) {
+    chart.innerHTML = '<p class="empty">No members met the ranking threshold.</p>';
+    return;
+  }
+  const maxAbs = Math.max(...top10.map(m => Math.abs(m.return_pct_estimate)), 1);
+  chart.innerHTML = top10.map((m, i) => {
     const pct = m.return_pct_estimate;
-    const isGood = pct >= 0;
-    const widthPct = (Math.abs(pct) / maxAbs) * 50;
-    const trades = m.trade_detail.map(t => {{
-      const dateInfo = t.sell_date ? `${{t.buy_date}} → ${{t.sell_date}}` : `${{t.buy_date}} (open)`;
-      return `<li>${{t.ticker}} — ${{t.type}} — ${{dateInfo}} — ${{fmtMoney(t.amount)}} → ${{t.gain >= 0 ? '+' : ''}}${{fmtMoney(t.gain)}}</li>`;
-    }}).join('');
+    const good = pct >= 0;
+    const width = (Math.abs(pct) / maxAbs) * 50;
+    const trades = m.trade_detail.map(t => {
+      const when = t.sell_date ? `${esc(t.buy_date)} → ${esc(t.sell_date)}`
+                               : `${esc(t.buy_date)} (open)`;
+      return `<li>${esc(t.ticker)} — ${esc(t.type)} — ${when} — ` +
+             `${esc(fmtMoney(t.amount))} → ${esc(fmtSigned(t.gain))}</li>`;
+    }).join('');
     return `
       <div class="bar-row">
-        <div class="bar-name">${{m.member}}<br><span class="dist">${{m.state_dist}}</span></div>
+        <div class="bar-name">${esc(m.member)}<br><span class="dist">${esc(m.state_dist)}</span></div>
         <div>
-          <div class="bar-track">
+          <div class="bar-track" data-idx="${i}" tabindex="0">
             <div class="bar-mid"></div>
-            <div class="bar-fill ${{isGood ? 'good' : 'bad'}}" style="width:${{widthPct}}%;"></div>
+            <div class="bar-fill ${good ? 'good' : 'bad'}" style="width:${width}%;"></div>
           </div>
-          <details><summary>${{m.trade_detail.length}} priced trade(s)</summary><ul class="trade-list">${{trades}}</ul></details>
+          <details><summary>${m.trade_detail.length} priced trade(s)</summary>
+            <ul class="trade-list">${trades}</ul></details>
         </div>
-        <div class="bar-pct ${{isGood ? 'good' : 'bad'}}">${{fmtPct(pct)}}</div>
+        <div class="bar-pct ${good ? 'good' : 'bad'}">${esc(fmtPct(pct))}</div>
       </div>`;
-  }}).join('');
-}}
+  }).join('');
+  attachTooltips(top10);
+}
+
+function attachTooltips(rows) {
+  const tip = document.getElementById('tooltip');
+  const show = (el, m) => {
+    tip.innerHTML =
+      `<div class="t-name">${esc(m.member)} (${esc(m.state_dist)})</div><dl>` +
+      `<dt>Est. return</dt><dd>${esc(fmtPct(m.return_pct_estimate))}</dd>` +
+      `<dt>Est. cost basis</dt><dd>${esc(fmtMoney(m.invested_total_estimate))}</dd>` +
+      `<dt>Realized</dt><dd>${esc(fmtSigned(m.realized_gain_estimate))}</dd>` +
+      `<dt>Unrealized</dt><dd>${esc(fmtSigned(m.unrealized_gain_estimate))}</dd>` +
+      `<dt>Priced trades</dt><dd>${esc(m.priced_trades)}</dd>` +
+      `</dl>`;
+    const r = el.getBoundingClientRect();
+    tip.style.opacity = '1';
+    tip.setAttribute('aria-hidden', 'false');
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    tip.style.left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8) + 'px';
+    tip.style.top = (r.top - h - 8 < 8 ? r.bottom + 8 : r.top - h - 8) + 'px';
+  };
+  const hide = () => { tip.style.opacity = '0'; tip.setAttribute('aria-hidden', 'true'); };
+  document.querySelectorAll('.bar-track').forEach(el => {
+    const m = rows[Number(el.dataset.idx)];
+    el.addEventListener('mouseenter', () => show(el, m));
+    el.addEventListener('focus', () => show(el, m));
+    el.addEventListener('mouseleave', hide);
+    el.addEventListener('blur', hide);
+  });
+}
 
 let sortKey = 'return_pct_estimate';
 let sortDir = -1;
-function renderTable() {{
-  const rows = DATA.members
-    .filter(m => m.return_pct_estimate !== null)
-    .sort((a, b) => (a[sortKey] > b[sortKey] ? 1 : -1) * sortDir);
+
+function compare(a, b, key) {
+  const x = a[key], y = b[key];
+  if (x === y) return 0;
+  if (x === null || x === undefined) return 1;   // nulls always last
+  if (y === null || y === undefined) return -1;
+  if (typeof x === 'number' && typeof y === 'number') return x - y;
+  return String(x).localeCompare(String(y));
+}
+
+function renderTable() {
+  // Ranked first, then the sort key -- so the threshold stays visible under any sort.
+  const rows = PRICED.slice().sort((a, b) =>
+    (b.ranked - a.ranked) || compare(a, b, sortKey) * sortDir);
   document.getElementById('full-table-body').innerHTML = rows.map(m => `
-    <tr>
-      <td>${{m.member}}</td>
-      <td>${{m.state_dist}}</td>
-      <td class="num">${{m.total_trades}}</td>
-      <td class="num">${{fmtMoney(m.invested_total_estimate)}}</td>
-      <td class="num">${{fmtMoney(m.total_gain_estimate)}}</td>
-      <td class="num"><span class="pill ${{m.return_pct_estimate >= 0 ? 'good' : 'bad'}}">${{fmtPct(m.return_pct_estimate)}}</span></td>
+    <tr class="${m.ranked ? '' : 'unranked'}">
+      <td>${esc(m.member)}${m.ranked ? '' : ' <span class="dist">(unranked)</span>'}</td>
+      <td>${esc(m.state_dist)}</td>
+      <td class="num">${esc(m.priced_trades)}</td>
+      <td class="num">${esc(fmtMoney(m.invested_total_estimate))}</td>
+      <td class="num">${esc(fmtSigned(m.realized_gain_estimate))}</td>
+      <td class="num">${esc(fmtSigned(m.unrealized_gain_estimate))}</td>
+      <td class="num"><span class="pill ${m.return_pct_estimate >= 0 ? 'good' : 'bad'}">${esc(fmtPct(m.return_pct_estimate))}</span></td>
     </tr>`).join('');
-}}
+}
 
-document.querySelectorAll('#full-table th').forEach(th => {{
-  th.addEventListener('click', () => {{
-    const key = th.dataset.key;
-    sortDir = (sortKey === key) ? -sortDir : -1;
-    sortKey = key;
-    renderTable();
-  }});
-}});
+function sortBy(th) {
+  const key = th.dataset.key;
+  sortDir = (sortKey === key) ? -sortDir : -1;
+  sortKey = key;
+  document.querySelectorAll('#full-table th').forEach(o => o.setAttribute('aria-sort', 'none'));
+  th.setAttribute('aria-sort', sortDir === -1 ? 'descending' : 'ascending');
+  renderTable();
+}
 
+document.querySelectorAll('#full-table th').forEach(th => {
+  th.addEventListener('click', () => sortBy(th));
+  th.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBy(th); }
+  });
+});
+
+renderHeader();
 renderChart();
 renderTable();
 </script>
@@ -243,28 +362,20 @@ renderTable();
 
 
 def main() -> None:
+    if not DATA_PATH.exists():
+        sys.exit(f"Missing {DATA_PATH} -- run build_leaderboard.py first")
     data = json.loads(DATA_PATH.read_text())
-    priced = [m for m in data["members"] if m["return_pct_estimate"] is not None]
-    priced_sorted = sorted(priced, key=lambda m: m["return_pct_estimate"], reverse=True)
-    top = priced_sorted[0]
-    avg_pct = sum(m["return_pct_estimate"] for m in priced) / len(priced) if priced else 0.0
-    total_trades = sum(m["total_trades"] for m in data["members"])
-    total_priced_trades = sum(m["priced_trades"] for m in data["members"])
+    if not data.get("members"):
+        print(f"warning: {DATA_PATH} has no members; rendering an empty dashboard",
+              file=sys.stderr)
 
-    html = TEMPLATE.format(
-        year=data["year"],
-        generated_at=data["generated_at"][:10],
-        n_priced=len(priced),
-        top_name_short=top["member"].replace("Hon. ", ""),
-        top_name=f"{top['member']} ({top['state_dist']})",
-        top_pct=top["return_pct_estimate"],
-        avg_pct=avg_pct,
-        priced_trades=total_priced_trades,
-        total_trades=total_trades,
-        data_json=json.dumps(data),
-    )
+    # Escape '<' so a member name or asset string can never close the <script> block.
+    payload = json.dumps(data).replace("<", "\\u003c")
+    html = TEMPLATE.replace(DATA_SENTINEL, payload)
     OUTPUT_PATH.write_text(html)
-    print(f"Wrote {OUTPUT_PATH}")
+
+    ranked = sum(1 for m in data.get("members", []) if m.get("ranked"))
+    print(f"Wrote {OUTPUT_PATH} ({ranked} ranked of {len(data.get('members', []))} members)")
 
 
 if __name__ == "__main__":

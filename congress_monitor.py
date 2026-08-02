@@ -2,132 +2,120 @@
 """Monitor new House PTR (Periodic Transaction Report) filings and post them to Slack."""
 
 import argparse
-import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
 from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
+    describe_asset,
     fetch_index,
     fetch_ptr_text,
+    filing_delay_days,
     format_filer_name,
     is_late_filing,
     parse_transactions,
 )
+from monitor_common import (
+    STATE_DIR,
+    add_common_args,
+    load_seen_doc_ids,
+    load_webhook_url,
+    log,
+    save_seen_doc_ids,
+    seed_baseline,
+    send_slack_message,
+)
 
-REPO_DIR = Path(__file__).resolve().parent
-STATE_PATH = REPO_DIR / "state" / "seen_docids.json"
-CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # webhook shared with fare-monitor
-
-
-def load_webhook_url() -> str:
-    if not CONFIG_PATH.exists():
-        sys.exit(f"Missing config file: {CONFIG_PATH}")
-    config = json.loads(CONFIG_PATH.read_text())
-    url = config.get("webhook_url")
-    if not url:
-        sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
-    return url
-
-
-def load_seen_doc_ids() -> set[str]:
-    if not STATE_PATH.exists():
-        return set()
-    return set(json.loads(STATE_PATH.read_text()))
-
-
-def save_seen_doc_ids(doc_ids: set[str]) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(sorted(doc_ids)))
+STATE_PATH = STATE_DIR / "seen_docids.json"
 
 
 def build_message(row: dict, transactions: list[dict]) -> str:
-    year = row["Year"]
-    doc_id = row["DocID"]
-    pdf_link = PDF_URL_TMPL.format(year=year, doc_id=doc_id)
+    filing_date = row.get("FilingDate", "?")
+    pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
     lines = [
         ":ballot_box: *New PTR Filing*",
         f"*{format_filer_name(row)}* ({row.get('StateDst', '?')})",
-        f"Filed: {row.get('FilingDate', '?')}",
+        f"Filed: {filing_date}",
         pdf_link,
     ]
     if transactions:
         lines.append("")
         for t in transactions:
-            late = " :rotating_light: LATE (>45 days)" if is_late_filing(t["txn_date"], t["notif_date"]) else ""
-            ticker = f" ({t['ticker']})" if t["ticker"] else ""
+            late = ""
+            if is_late_filing(t["txn_date"], filing_date):
+                delay = filing_delay_days(t["txn_date"], filing_date)
+                late = f" :rotating_light: LATE ({delay} days)"
+            partial = " partial" if t["partial"] else ""
             lines.append(
-                f"- [{t['owner']}] {t['type']}{ticker} -- {t['asset']} -- "
-                f"{t['txn_date']} -> notified {t['notif_date']} -- {t['amount']}{late}"
+                f"- [{t['owner']}] {t['type']}{partial} -- {describe_asset(t)} -- "
+                f"{t['txn_date']} -- {t['amount']}{late}"
             )
     else:
         lines.append("_(could not auto-parse transaction details -- see PDF)_")
     return "\n".join(lines)
 
 
-def send_slack_message(webhook_url: str, text: str) -> None:
-    resp = requests.post(webhook_url, json={"text": text}, timeout=15)
-    resp.raise_for_status()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--verbose", action="store_true", help="Print per-filing debug info")
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_common_args(parser)
     args = parser.parse_args()
 
-    webhook_url = load_webhook_url()
+    webhook_url = None if args.dry_run else load_webhook_url()
     year = datetime.now(timezone.utc).year
-    now = datetime.now(timezone.utc)
 
     rows = fetch_index(year)
     ptr_rows = [r for r in rows if r.get("FilingType") == PTR_FILING_TYPE]
     if args.verbose:
         print(f"-- {len(rows)} total filings, {len(ptr_rows)} PTRs for {year} --")
 
-    first_run = not STATE_PATH.exists()
-    seen = load_seen_doc_ids()
-
-    if first_run:
-        # Baseline run: record everything that already exists without alerting on
-        # the historical backlog. Only filings that show up in future runs are new.
-        all_ids = {r["DocID"] for r in ptr_rows}
-        save_seen_doc_ids(all_ids)
-        print(f"[{now.isoformat()}] First run: seeded baseline with {len(all_ids)} existing "
-              f"PTR(s), no alerts sent. Future runs will alert on genuinely new filings.")
+    if not STATE_PATH.exists():
+        # Baseline run: record everything that already exists without alerting on the
+        # historical backlog. Only filings that show up in future runs are new.
+        seed_baseline(STATE_PATH, {r["DocID"] for r in ptr_rows}, f"PTR(s) for {year}")
         return
 
+    seen = load_seen_doc_ids(STATE_PATH)
     new_rows = [r for r in ptr_rows if r["DocID"] not in seen]
+    backlog = max(0, len(new_rows) - args.max_alerts)
+    if backlog:
+        log(f"{len(new_rows)} new PTR(s) exceeds --max-alerts={args.max_alerts}; "
+            f"posting {args.max_alerts} now, leaving {backlog} for the next run.")
+        new_rows = new_rows[: args.max_alerts]
     if args.verbose:
-        print(f"-- {len(new_rows)} new PTR(s) not yet seen --")
+        print(f"-- {len(new_rows)} new PTR(s) to alert on --")
 
     sent = 0
     for row in new_rows:
         doc_id = row["DocID"]
         try:
-            pdf_text = fetch_ptr_text(year, doc_id)
+            pdf_text = fetch_ptr_text(row["Year"], doc_id)
             transactions = parse_transactions(pdf_text) if pdf_text else []
         except Exception as exc:
-            print(f"[{now.isoformat()}] Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
+            print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
 
         message = build_message(row, transactions)
-        if args.verbose:
+        if args.verbose or args.dry_run:
             print(message)
             print("---")
+        if args.dry_run:
+            sent += 1
+            continue
         try:
             send_slack_message(webhook_url, message)
             sent += 1
         except requests.RequestException as exc:
-            print(f"[{now.isoformat()}] Failed to send Slack message for {doc_id}: {exc}", file=sys.stderr)
+            print(f"Failed to send Slack message for {doc_id}: {exc}", file=sys.stderr)
             continue  # don't mark as seen if we couldn't alert
         seen.add(doc_id)
-        save_seen_doc_ids(seen)  # persist immediately so a crash mid-run can't cause resends
+        save_seen_doc_ids(STATE_PATH, seen)  # persist per alert so a crash can't resend
 
-    print(f"[{now.isoformat()}] Sent {sent} new PTR alert(s) out of {len(new_rows)} new filing(s).")
+    verb = "Would send" if args.dry_run else "Sent"
+    log(f"{verb} {sent} new PTR alert(s) out of {len(new_rows)} new filing(s)."
+        + (f" {backlog} deferred." if backlog else ""))
 
 
 if __name__ == "__main__":

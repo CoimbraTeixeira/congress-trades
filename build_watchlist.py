@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Snapshot the current top-10 (by leaderboard.json) into watchlist.json, keyed by
-the raw (Last, First, StateDst) fields so watchlist_monitor.py can match future
-index rows without re-parsing names."""
+"""Snapshot the current top-N ranked members from leaderboard.json into watchlist.json.
 
+Identity is carried through as the raw (Last, First, StateDst) index fields that
+build_leaderboard.py records, so watchlist_monitor.py can match future index rows
+directly -- no round-tripping through a formatted display name.
+"""
+
+import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-from house_disclosures import PTR_FILING_TYPE, fetch_index, format_filer_name
 
 REPO_DIR = Path(__file__).resolve().parent
 LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
@@ -15,39 +18,41 @@ WATCHLIST_PATH = REPO_DIR / "watchlist.json"
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--top", type=int, default=10, help="How many members to watch")
+    args = parser.parse_args()
+
+    if not LEADERBOARD_PATH.exists():
+        sys.exit(f"Missing {LEADERBOARD_PATH} -- run build_leaderboard.py first")
     leaderboard = json.loads(LEADERBOARD_PATH.read_text())
-    priced = [m for m in leaderboard["members"] if m["return_pct_estimate"] is not None]
-    top10 = sorted(priced, key=lambda m: m["return_pct_estimate"], reverse=True)[:10]
 
-    rows = fetch_index(leaderboard["year"])
-    ptr_rows = [r for r in rows if r.get("FilingType") == PTR_FILING_TYPE]
-    by_name_state = {}
-    for r in ptr_rows:
-        by_name_state.setdefault((format_filer_name(r), r.get("StateDst")), r)
+    ranked = [m for m in leaderboard["members"] if m.get("ranked")]
+    if not ranked:
+        sys.exit("No ranked members in the leaderboard -- nothing to watch. "
+                 "Lower --min-invested/--min-trades in build_leaderboard.py.")
+    top = sorted(ranked, key=lambda m: m["return_pct_estimate"], reverse=True)[:args.top]
 
-    watched = []
-    unmatched = []
-    for m in top10:
-        row = by_name_state.get((m["member"], m["state_dist"]))
-        if row:
-            watched.append({
-                "member": m["member"],
-                "last": row.get("Last", ""),
-                "first": row.get("First", ""),
-                "state_dist": row.get("StateDst", ""),
-                "return_pct_estimate": m["return_pct_estimate"],
-            })
-        else:
-            unmatched.append(m["member"])
+    missing = [m["member"] for m in top if not m.get("last")]
+    if missing:
+        sys.exit(f"Leaderboard entries lack raw identity fields: {missing}. "
+                 f"Regenerate leaderboard.json with the current build_leaderboard.py.")
 
     WATCHLIST_PATH.write_text(json.dumps({
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_leaderboard_generated_at": leaderboard["generated_at"],
-        "members": watched,
+        "members": [
+            {
+                "member": m["member"],
+                "last": m["last"],
+                "first": m["first"],
+                "state_dist": m["state_dist"],
+                "return_pct_estimate": m["return_pct_estimate"],
+            }
+            for m in top
+        ],
     }, indent=2))
-    print(f"Wrote {len(watched)} member(s) to {WATCHLIST_PATH}")
-    if unmatched:
-        print(f"WARNING: could not match {len(unmatched)} member(s): {unmatched}")
+    print(f"Wrote {len(top)} member(s) to {WATCHLIST_PATH} "
+          f"(of {len(ranked)} ranked, {len(leaderboard['members'])} total)")
 
 
 if __name__ == "__main__":

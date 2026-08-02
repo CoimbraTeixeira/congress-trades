@@ -1,0 +1,48 @@
+ID         Owner Asset                                            Transaction Date                 Notification Amount                     Cap.
+                                                                  Type                             Date                                    Gains >
+                                                                                                                                           $200?
+
+           SP         American Water Works Company,               S                 01/14/2026 02/04/2026             $50,001 -
+                      Inc. Common Stock (AWK) [ST]                                                                    $100,000
+                      F      S       : New
+                      S             O : R.W. Allen & Associates, Inc. > RWA&A - Securities
+
+
+           SP         Paychex, Inc. - Common Stock                S                 01/14/2026 02/04/2026             $15,001 -
+                      (PAYX) [ST]                                                                                     $50,000
+                      F      S       : New
+                      S             O : LIVTR
+
+
+           SP         S&P Global Inc. Common Stock                P                 01/14/2026 02/04/2026             $15,001 -
+                      (SPGI) [ST]                                                                                     $50,000
+                      F      S       : New
+                      S             O : R.W. Allen & Associates, Inc. > RWA&A - Securities
+
+
+                      US Treasury Note 3.5% DUE                   P                 01/26/2026 02/04/2026             $100,001 -
+                      01/31/28 (91282CGH8) [GS]                                                                       $250,000
+                      F      S       : New
+                      S             O : SCH1
+
+
+
+                                                                                                                                  $200?
+
+                      Amazon.com, Inc. - Common Stock         S (partial)      03/16/2026 03/16/2026          $1,001 - $15,000
+                      (AMZN) [ST]
+                      F      S      : New
+                      S            O : Putnam Investments
+                      D           : The full transaction included the following sales: T – 37.426 shares sold @ $27.645/share BRK/B – 3 shares
+
+
+           International Business Machines        P                  06/16/2026 07/02/2026   $15,001 -
+
+ID   Owner Asset                                  Transaction Date              Notification Amount             Cap.
+                                                  Type                          Date                            Gains >
+                                                                                                                $200?
+           Corporation Common Stock (IBM)                                                    $50,000
+           [ST]
+           F       S    : New
+           S           O : 150 Main Street Trust > Bank of America
+
