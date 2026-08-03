@@ -11,11 +11,23 @@ import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from house_disclosures import filing_sort_key, index_years  # noqa: E402
-from monitor_common import baseline_docids, is_within_window  # noqa: E402
+import monitor_common  # noqa: E402
+from monitor_common import (  # noqa: E402
+    DISCORD_MESSAGE_LIMIT,
+    MAX_RETRY_SLEEP,
+    baseline_docids,
+    escape_markdown,
+    is_within_window,
+    send_discord_message,
+    split_message,
+)
 from watchlist_monitor import build_message, collapse_buys  # noqa: E402
 from daily_summary import (  # noqa: E402
     build_digest,
@@ -266,8 +278,110 @@ class BuildDigestTest(unittest.TestCase):
 
     def test_oversized_digest_is_truncated(self):
         msg = build_digest(self.NOW, [self._entry()] * 400, "est. return", 50, 50)
-        self.assertLess(len(msg), 12_100)
         self.assertTrue(msg.endswith("_(truncated)_"))
+
+    def test_truncated_digest_still_fits_the_message_budget(self):
+        """The marker must not push the digest into an extra Discord message."""
+        msg = build_digest(self.NOW, [self._entry()] * 400, "est. return", 50, 50)
+        self.assertLessEqual(len(split_message(msg)), 3)
+
+
+class FakeResponse:
+    def __init__(self, status_code=204, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class EscapeMarkdownTest(unittest.TestCase):
+    def test_escapes_discord_markdown(self):
+        self.assertEqual(escape_markdown("*Hon* Filer"), r"\*Hon\* Filer")
+        self.assertEqual(escape_markdown("A_B"), r"A\_B")
+
+    def test_escapes_backslash_first(self):
+        self.assertEqual(escape_markdown(r"a\*b"), r"a\\\*b")
+
+    def test_leaves_ampersand_alone(self):
+        """Discord renders &amp; literally; entity escaping was a Slack requirement."""
+        self.assertEqual(escape_markdown("AT&T Inc."), "AT&T Inc.")
+
+
+class SplitMessageTest(unittest.TestCase):
+    def test_short_message_is_one_chunk(self):
+        self.assertEqual(split_message("a\nb"), ["a\nb"])
+
+    def test_empty_message_still_yields_a_chunk(self):
+        self.assertEqual(split_message(""), [""])
+
+    def test_chunks_respect_the_limit_and_lose_nothing(self):
+        text = "\n".join(f"- filing {i} " + "x" * 90 for i in range(200))
+        chunks = split_message(text)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual("\n".join(chunks), text)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), DISCORD_MESSAGE_LIMIT)
+
+    def test_line_longer_than_the_limit_is_hard_split(self):
+        chunks = split_message("z" * (DISCORD_MESSAGE_LIMIT * 2 + 1))
+        self.assertEqual(len(chunks), 3)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), DISCORD_MESSAGE_LIMIT)
+
+
+class SendDiscordMessageTest(unittest.TestCase):
+    """A PTR disclosing enough transactions clears Discord's 2000-char limit, which it
+    rejects outright rather than truncating -- so an unsplit alert is a lost alert."""
+
+    def _capture(self, responses=None):
+        posted = []
+        seq = list(responses or [])
+
+        def fake_post(url, json=None, timeout=None):
+            posted.append(json)
+            return seq.pop(0) if seq else FakeResponse()
+
+        return posted, fake_post
+
+    def test_uses_discord_content_key(self):
+        posted, fake_post = self._capture()
+        with mock.patch.object(monitor_common.requests, "post", fake_post):
+            send_discord_message("https://hook", "hello")
+        self.assertEqual(posted, [{"content": "hello"}])
+
+    def test_oversized_message_is_split_across_posts(self):
+        posted, fake_post = self._capture()
+        text = "\n".join(f"- line {i} " + "y" * 90 for i in range(200))
+        with mock.patch.object(monitor_common.requests, "post", fake_post):
+            send_discord_message("https://hook", text)
+        self.assertGreater(len(posted), 1)
+        for payload in posted:
+            self.assertLessEqual(len(payload["content"]), DISCORD_MESSAGE_LIMIT)
+        self.assertEqual("\n".join(p["content"] for p in posted), text)
+
+    def test_retries_after_rate_limit(self):
+        posted, fake_post = self._capture(
+            [FakeResponse(429, {"retry_after": 0.01}), FakeResponse()])
+        with mock.patch.object(monitor_common.requests, "post", fake_post), \
+                mock.patch.object(monitor_common.time, "sleep") as slept:
+            send_discord_message("https://hook", "hi")
+        self.assertEqual(len(posted), 2)
+        slept.assert_called_once()
+
+    def test_rate_limit_wait_is_capped(self):
+        _, fake_post = self._capture([FakeResponse(429, {"retry_after": 99999})] * 9)
+        with mock.patch.object(monitor_common.requests, "post", fake_post), \
+                mock.patch.object(monitor_common.time, "sleep") as slept:
+            with self.assertRaises(requests.HTTPError):
+                send_discord_message("https://hook", "hi")
+        for call in slept.call_args_list:
+            self.assertLessEqual(call[0][0], MAX_RETRY_SLEEP)
 
 
 if __name__ == "__main__":

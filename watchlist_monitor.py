@@ -30,11 +30,12 @@ from monitor_common import (
     STATE_DIR,
     add_common_args,
     baseline_docids,
+    escape_markdown,
     load_watch_state,
     load_webhook_url,
     log,
     save_watch_state,
-    send_slack_message,
+    send_discord_message,
 )
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -60,8 +61,9 @@ def build_message(member: dict, row: dict, buys: list[dict]) -> str:
         "just filed a new PTR -- transaction details could not be auto-parsed:"
     )
     lines = [
-        ":rotating_light: *Watchlist Buy Alert*",
-        f"*{member['member']}* ({member['state_dist']}) -- watchlist #{member['rank']} "
+        "🚨 **Watchlist Buy Alert**",
+        f"**{escape_markdown(member['member'])}** ({member['state_dist']}) -- "
+        f"watchlist #{member['rank']} "
         f"({member['return_pct_estimate']:+.1f}% est. return) {headline}",
         "",
     ]
@@ -70,9 +72,9 @@ def build_message(member: dict, row: dict, buys: list[dict]) -> str:
         repeat = f" x{count}" if count > 1 else ""
         late = ""
         if is_late_filing(t["txn_date"], filing_date):
-            late = f" :rotating_light: LATE ({filing_delay_days(t['txn_date'], filing_date)} days)"
+            late = f" 🚨 LATE ({filing_delay_days(t['txn_date'], filing_date)} days)"
         lines.append(
-            f"- [{t['owner']}]{partial} {describe_asset(t)}{repeat} -- "
+            f"- [{t['owner']}]{partial} {escape_markdown(describe_asset(t))}{repeat} -- "
             f"{t['txn_date']} -- {t['amount']}{late}"
         )
     if not buys:
@@ -167,9 +169,9 @@ def main() -> None:
                 print("---")
             if not args.dry_run:
                 try:
-                    send_slack_message(webhook_url, message)
+                    send_discord_message(webhook_url, message)
                 except requests.RequestException as exc:
-                    print(f"Failed to send Slack message for {doc_id}: {exc}", file=sys.stderr)
+                    print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
                     continue  # don't mark as seen if we couldn't alert
             sent += 1
         if not args.dry_run:

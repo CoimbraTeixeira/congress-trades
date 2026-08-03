@@ -1,7 +1,7 @@
 # congress-trades
 
 Tracks US House stock trades from the Clerk's public Periodic Transaction Report
-(PTR) disclosures: Slack alerts on new filings, plus an estimated performance
+(PTR) disclosures: Discord alerts on new filings, plus an estimated performance
 leaderboard and a static dashboard.
 
 Data comes from the House Clerk's bulk archive (`disclosures-clerk.house.gov`) —
@@ -15,13 +15,13 @@ pip install -r requirements.txt
 sudo apt install poppler-utils          # provides pdftotext, used to read the PDFs
 ```
 
-Slack delivery reads a webhook from `~/.config/fare-monitor/config.json` (shared with
+Discord delivery reads a webhook from `~/.config/fare-monitor/config.json` (shared with
 the fare-monitor project). The webhook is a bearer credential — anyone holding it can
 post to the channel — so keep it out of the repo and readable only by you:
 
 ```bash
 mkdir -p ~/.config/fare-monitor
-echo '{"webhook_url": "https://hooks.slack.com/services/..."}' > ~/.config/fare-monitor/config.json
+echo '{"webhook_url": "https://discord.com/api/webhooks/..."}' > ~/.config/fare-monitor/config.json
 chmod 600 ~/.config/fare-monitor/config.json
 
 git config core.hooksPath hooks   # enable the pre-commit secret guard
@@ -38,7 +38,7 @@ the `core.hooksPath` line above is required once per clone. Bypass a false posit
 | Script | What it does |
 |---|---|
 | `house_disclosures.py` | Shared library: fetch the index, pull a PTR PDF, parse its transaction table |
-| `monitor_common.py` | Shared monitor plumbing: webhook config, seen-DocID state, Slack delivery |
+| `monitor_common.py` | Shared monitor plumbing: webhook config, seen-DocID state, Discord delivery |
 | `congress_monitor.py` | Alerts on **every** new PTR filing |
 | `build_leaderboard.py` | Estimates per-member returns → `leaderboard.json` |
 | `build_watchlist.py` | Snapshots the top-N ranked members → `watchlist.json` |
@@ -59,7 +59,7 @@ python3 daily_summary.py --dry-run
 
 ## The daily digest
 
-`daily_summary.py` posts one Slack message a day covering the top-N leaderboard
+`daily_summary.py` posts one Discord message a day covering the top-N leaderboard
 members: a roll-up of tickers more than one member touched, then a per-member buy/sell
 breakdown with PDF links. Where the two monitors alert per filing as it lands, this is
 the once-a-day read across the wider field.

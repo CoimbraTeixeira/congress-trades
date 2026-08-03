@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor new House PTR (Periodic Transaction Report) filings and post them to Slack."""
+"""Monitor new House PTR (Periodic Transaction Report) filings and post them to Discord."""
 
 import argparse
 import sys
@@ -23,12 +23,13 @@ from house_disclosures import (
 from monitor_common import (
     STATE_DIR,
     add_common_args,
+    escape_markdown,
     load_seen_doc_ids,
     load_webhook_url,
     log,
     save_seen_doc_ids,
     seed_baseline,
-    send_slack_message,
+    send_discord_message,
 )
 
 STATE_PATH = STATE_DIR / "seen_docids.json"
@@ -38,8 +39,8 @@ def build_message(row: dict, transactions: list[dict]) -> str:
     filing_date = row.get("FilingDate", "?")
     pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
     lines = [
-        ":ballot_box: *New PTR Filing*",
-        f"*{format_filer_name(row)}* ({row.get('StateDst', '?')})",
+        "🗳️ **New PTR Filing**",
+        f"**{escape_markdown(format_filer_name(row))}** ({row.get('StateDst', '?')})",
         f"Filed: {filing_date}",
         pdf_link,
     ]
@@ -49,10 +50,11 @@ def build_message(row: dict, transactions: list[dict]) -> str:
             late = ""
             if is_late_filing(t["txn_date"], filing_date):
                 delay = filing_delay_days(t["txn_date"], filing_date)
-                late = f" :rotating_light: LATE ({delay} days)"
+                late = f" 🚨 LATE ({delay} days)"
             partial = " partial" if t["partial"] else ""
             lines.append(
-                f"- [{t['owner']}] {t['type']}{partial} -- {describe_asset(t)} -- "
+                f"- [{t['owner']}] {t['type']}{partial} -- "
+                f"{escape_markdown(describe_asset(t))} -- "
                 f"{t['txn_date']} -- {t['amount']}{late}"
             )
     else:
@@ -111,10 +113,10 @@ def main() -> None:
             sent += 1
             continue
         try:
-            send_slack_message(webhook_url, message)
+            send_discord_message(webhook_url, message)
             sent += 1
         except requests.RequestException as exc:
-            print(f"Failed to send Slack message for {doc_id}: {exc}", file=sys.stderr)
+            print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
             continue  # don't mark as seen if we couldn't alert
         seen.add(doc_id)
         save_seen_doc_ids(STATE_PATH, seen)  # persist per alert so a crash can't resend

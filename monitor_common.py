@@ -1,8 +1,9 @@
-"""Shared plumbing for the Slack monitors: webhook config, seen-doc state, delivery."""
+"""Shared plumbing for the Discord monitors: webhook config, seen-doc state, delivery."""
 
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,16 @@ CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # shared
 # problem rather than a real burst of filings. The excess is left unseen so the next
 # run picks it up, rather than being silently dropped.
 DEFAULT_MAX_ALERTS = 25
+
+# Discord rejects a message body over 2000 characters outright (HTTP 400) rather than
+# truncating it, so this is a hard delivery constraint rather than a style preference.
+# A PTR disclosing a few dozen transactions clears it easily.
+DISCORD_MESSAGE_LIMIT = 2000
+
+# Webhooks are limited to roughly 5 requests per 2 seconds. A backlog run posts in a
+# loop, so 429s are expected rather than exceptional; Discord states how long to wait.
+RATE_LIMIT_RETRIES = 3
+MAX_RETRY_SLEEP = 30.0
 
 # When a member joins a watched set, their existing filings are baselined away rather
 # than replayed -- but a just-promoted member's trade from a few days ago is exactly the
@@ -39,6 +50,14 @@ def load_webhook_url() -> str:
     url = config.get("webhook_url")
     if not url:
         sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
+    if "hooks.slack.com" in url:
+        # Posting a Discord payload at a Slack webhook fails as an opaque 400. Naming
+        # the leftover config is the difference between a one-line fix and an evening.
+        sys.exit(
+            f"{CONFIG_PATH} still holds a Slack webhook. These monitors post to Discord "
+            f"now -- replace it with a Discord webhook URL "
+            f"(Server Settings -> Integrations -> Webhooks)."
+        )
     return url
 
 
@@ -123,9 +142,70 @@ def baseline_docids(rows: list[dict], members: set[tuple], now: datetime,
     }
 
 
-def send_slack_message(webhook_url: str, text: str) -> None:
-    resp = requests.post(webhook_url, json={"text": text}, timeout=15)
-    resp.raise_for_status()
+def escape_markdown(text: str) -> str:
+    """Neutralise Discord markdown in third-party text.
+
+    Filer and asset names come from the Clerk's PDFs, so an underscore or asterisk in
+    one would otherwise italicise the rest of an alert. Note this escapes markdown
+    rather than HTML entities -- Discord renders `&amp;` literally, so the Slack-era
+    entity escaping would have shown up as visible noise."""
+    for char in ("\\", "*", "_", "~", "`", "|"):
+        text = text.replace(char, "\\" + char)
+    return text
+
+
+def split_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split an over-long message into Discord-sized pieces on line boundaries.
+
+    Splitting mid-line would cut a filing in half, so lines are kept whole; a single
+    line longer than the limit (a filing with a very long asset list) is hard-split as
+    a last resort. Returns [""] for empty input so callers still post something rather
+    than silently sending nothing."""
+    chunks: list[str] = []
+    current: list[str] = []
+    length = 0
+
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current, length = [], 0
+            chunks.append(line[:limit])
+            line = line[limit:]
+        # +1 for the newline joining this line to the previous one.
+        if current and length + 1 + len(line) > limit:
+            chunks.append("\n".join(current))
+            current, length = [], 0
+        current.append(line)
+        length += len(line) + (1 if length else 0)
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
+def _post_chunk(webhook_url: str, content: str) -> None:
+    """POST one chunk, honouring Discord's stated wait on a rate-limit response."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        resp = requests.post(webhook_url, json={"content": content}, timeout=15)
+        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+            resp.raise_for_status()  # Discord returns 204 No Content on success
+            return
+        try:
+            wait = float(resp.json().get("retry_after", 1.0))
+        except (ValueError, AttributeError, requests.exceptions.JSONDecodeError):
+            wait = float(resp.headers.get("Retry-After", 1.0) or 1.0)
+        # Cap it: a malformed retry_after should not park a cron run for hours.
+        time.sleep(min(max(wait, 0.0), MAX_RETRY_SLEEP))
+
+
+def send_discord_message(webhook_url: str, text: str) -> None:
+    """Deliver a message, splitting it if it exceeds Discord's per-message limit.
+
+    Chunking lives here rather than in the callers so every monitor is covered: any of
+    them can generate an over-limit message given a filing with enough transactions."""
+    for chunk in split_message(text):
+        _post_chunk(webhook_url, chunk)
 
 
 def seed_baseline(path: Path, doc_ids: set[str], label: str) -> None:
@@ -137,7 +217,7 @@ def seed_baseline(path: Path, doc_ids: set[str], label: str) -> None:
 def add_common_args(parser) -> None:
     parser.add_argument("--verbose", action="store_true", help="Print per-filing debug info")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Print alerts without posting to Slack or recording state")
+                        help="Print alerts without posting to Discord or recording state")
     parser.add_argument("--max-alerts", type=int, default=DEFAULT_MAX_ALERTS,
                         help=f"Cap alerts per run (default {DEFAULT_MAX_ALERTS}); "
                              f"the remainder is left for the next run")

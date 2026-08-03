@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Daily digest of trades filed by the top-N members of the leaderboard.
 
-One consolidated Slack post per run rather than one per filing: a roll-up of the most
+One consolidated Discord post per run rather than one per filing: a roll-up of the most
 traded tickers, then a per-member breakdown. Complements the two per-filing monitors --
 congress_monitor.py alerts on everything as it lands, watchlist_monitor.py alerts fast
 on the top 10's buys, and this gives the wider top-N a once-a-day read.
@@ -37,11 +37,13 @@ from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
     STATE_DIR,
     baseline_docids,
+    escape_markdown,
     load_watch_state,
     load_webhook_url,
     log,
     save_watch_state,
-    send_slack_message,
+    send_discord_message,
+    split_message,
 )
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -49,9 +51,13 @@ LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
 STATE_PATH = STATE_DIR / "summary_seen_docids.json"
 
 DEFAULT_TOP = 50
-# Slack renders a webhook post as one message; past a few thousand characters it stops
-# being readable long before it hits the API limit. Trim the tail and say so.
-MAX_MESSAGE_CHARS = 12_000
+# Discord caps a message at 2000 characters and send_discord_message() splits anything
+# longer, so the old 12k character ceiling would now land as seven consecutive posts.
+# Past about three the digest stops being a digest. The cap is expressed in messages
+# rather than characters because line-boundary splitting leaves each chunk short of the
+# limit -- a 3x2000 character budget really produces four posts, not three.
+MAX_DIGEST_MESSAGES = 3
+TRUNCATION_MARKER = "\n_(truncated)_"
 MAX_TICKERS_PER_LINE = 8
 FETCH_WORKERS = 6
 
@@ -124,7 +130,7 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
         scope += f" (of {requested} requested; only {covered} qualify)"
 
     lines = [
-        f":bar_chart: *Daily Congress Trade Summary* -- {now:%Y-%m-%d}",
+        f"📊 **Daily Congress Trade Summary** -- {now:%Y-%m-%d}",
         f"_{scope} · {len(entries)} new filing(s) from {len(members)} member(s) · "
         f"{txn_count} transaction(s)_",
         f"Est. bought {fmt_dollars(total_buy)} · Est. sold {fmt_dollars(total_sell)}",
@@ -139,19 +145,31 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
         rank = f"#{member['rank']}"
         ret = member.get("return_pct_estimate")
         ret_label = f", {ret:+.1f}%" if ret is not None else ""
-        lines += ["", f"*{member['member']}* ({member['state_dist']}, {rank}{ret_label})"]
+        lines += ["", f"**{escape_markdown(member['member'])}** "
+                      f"({member['state_dist']}, {rank}{ret_label})"]
         if summary["buys"]:
-            lines.append(f"  :large_green_circle: BUY  {format_side(summary['buys'])}")
+            lines.append(f"  🟢 BUY  {format_side(summary['buys'])}")
         if summary["sells"]:
-            lines.append(f"  :red_circle: SELL {format_side(summary['sells'])}")
+            lines.append(f"  🔴 SELL {format_side(summary['sells'])}")
         if not summary["buys"] and not summary["sells"]:
             lines.append("  _(no transactions parsed -- see PDF)_")
         lines.append(f"  {entry['pdf_link']}")
 
-    text = "\n".join(lines)
-    if len(text) > MAX_MESSAGE_CHARS:
-        text = text[:MAX_MESSAGE_CHARS].rsplit("\n", 1)[0] + "\n_(truncated)_"
-    return text
+    return truncate_to_messages("\n".join(lines))
+
+
+def truncate_to_messages(text: str) -> str:
+    """Trim a digest to at most MAX_DIGEST_MESSAGES Discord messages.
+
+    Measured in the same chunks delivery will actually produce, so the ceiling means
+    what it says. Dropping the tail line makes room for the marker inside the last
+    message rather than spilling into another one."""
+    chunks = split_message(text)
+    if len(chunks) <= MAX_DIGEST_MESSAGES:
+        return text
+    kept = "\n".join(chunks[:MAX_DIGEST_MESSAGES])
+    budget = max(len(kept) - len(TRUNCATION_MARKER), 0)
+    return kept[:budget].rsplit("\n", 1)[0] + TRUNCATION_MARKER
 
 
 def most_traded(entries: list[dict]) -> list[str]:
@@ -171,7 +189,8 @@ def most_traded(entries: list[dict]) -> list[str]:
         shared = sorted(((t, len(w)) for t, w in tally.items() if len(w) > 1),
                         key=lambda kv: (-kv[1], kv[0]))[:5]
         if shared:
-            lines.append(f"*{verb}:* " + ", ".join(f"{t} ({n} members)" for t, n in shared))
+            lines.append(f"**{verb}:** "
+                         + ", ".join(f"{escape_markdown(t)} ({n} members)" for t, n in shared))
     return lines
 
 
@@ -267,7 +286,7 @@ def main() -> None:
         return
 
     try:
-        send_slack_message(webhook_url, message)
+        send_discord_message(webhook_url, message)
     except requests.RequestException as exc:
         # Leave every DocID unseen so the next run retries rather than losing the day.
         sys.exit(f"Failed to post the digest: {exc}")
