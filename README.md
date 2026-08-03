@@ -15,11 +15,23 @@ pip install -r requirements.txt
 sudo apt install poppler-utils          # provides pdftotext, used to read the PDFs
 ```
 
-Slack delivery reads a webhook from `~/.config/fare-monitor/config.json`:
+Slack delivery reads a webhook from `~/.config/fare-monitor/config.json` (shared with
+the fare-monitor project). The webhook is a bearer credential — anyone holding it can
+post to the channel — so keep it out of the repo and readable only by you:
 
-```json
-{ "webhook_url": "https://hooks.slack.com/services/..." }
+```bash
+mkdir -p ~/.config/fare-monitor
+echo '{"webhook_url": "https://hooks.slack.com/services/..."}' > ~/.config/fare-monitor/config.json
+chmod 600 ~/.config/fare-monitor/config.json
+
+git config core.hooksPath hooks   # enable the pre-commit secret guard
 ```
+
+This repo is public, and the design keeps the webhook out of it entirely. `hooks/pre-commit`
+enforces that: it scans staged content for webhook URLs, API tokens and private keys, and
+refuses the commit if it finds one. Git does not enable repo-tracked hooks automatically, so
+the `core.hooksPath` line above is required once per clone. Bypass a false positive with
+`git commit --no-verify`.
 
 ## The pieces
 
