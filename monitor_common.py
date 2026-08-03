@@ -50,13 +50,12 @@ def load_webhook_url() -> str:
     url = config.get("webhook_url")
     if not url:
         sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
-    if "hooks.slack.com" in url:
-        # Posting a Discord payload at a Slack webhook fails as an opaque 400. Naming
-        # the leftover config is the difference between a one-line fix and an evening.
+    if "discord.com/api/webhooks/" not in url and "discordapp.com/api/webhooks/" not in url:
+        # A webhook from somewhere else would fail as an opaque 400 from Discord.
+        # Naming the config is the difference between a one-line fix and an evening.
         sys.exit(
-            f"{CONFIG_PATH} still holds a Slack webhook. These monitors post to Discord "
-            f"now -- replace it with a Discord webhook URL "
-            f"(Server Settings -> Integrations -> Webhooks)."
+            f"{CONFIG_PATH} does not hold a Discord webhook URL. These monitors post to "
+            f"Discord -- get one from Server Settings -> Integrations -> Webhooks."
         )
     return url
 
@@ -146,9 +145,9 @@ def escape_markdown(text: str) -> str:
     """Neutralise Discord markdown in third-party text.
 
     Filer and asset names come from the Clerk's PDFs, so an underscore or asterisk in
-    one would otherwise italicise the rest of an alert. Note this escapes markdown
-    rather than HTML entities -- Discord renders `&amp;` literally, so the Slack-era
-    entity escaping would have shown up as visible noise."""
+    one would otherwise italicise the rest of an alert. This escapes markdown rather
+    than HTML entities: Discord renders `&amp;` literally, so entity escaping would
+    show up as visible noise."""
     for char in ("\\", "*", "_", "~", "`", "|"):
         text = text.replace(char, "\\" + char)
     return text

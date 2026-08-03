@@ -309,7 +309,7 @@ class EscapeMarkdownTest(unittest.TestCase):
         self.assertEqual(escape_markdown(r"a\*b"), r"a\\\*b")
 
     def test_leaves_ampersand_alone(self):
-        """Discord renders &amp; literally; entity escaping was a Slack requirement."""
+        """Discord renders &amp; literally, so entities must not be escaped."""
         self.assertEqual(escape_markdown("AT&T Inc."), "AT&T Inc.")
 
 
