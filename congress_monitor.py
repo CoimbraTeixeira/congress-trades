@@ -10,23 +10,24 @@ import requests
 from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
-    describe_asset,
     fetch_index_years,
     fetch_ptr_text,
-    filing_delay_days,
     filing_sort_key,
     format_filer_name,
     index_years,
-    is_late_filing,
     parse_transactions,
 )
 from monitor_common import (
+    LATE_LEGEND,
     STATE_DIR,
     add_common_args,
+    any_late,
     escape_markdown,
+    format_transaction,
     load_seen_doc_ids,
     load_webhook_url,
     log,
+    plural,
     save_seen_doc_ids,
     seed_baseline,
     send_discord_message,
@@ -34,31 +35,45 @@ from monitor_common import (
 
 STATE_PATH = STATE_DIR / "seen_docids.json"
 
+# Buys first, then sells, then exchanges. The PDF's own order is however the filer's
+# broker happened to list the rows, which interleaves the two directions and makes a
+# filing look busier than it is.
+DIRECTION_ORDER = {"Purchase": 0, "Sale": 1, "Exchange": 2}
+
 
 def build_message(row: dict, transactions: list[dict]) -> str:
     filing_date = row.get("FilingDate", "?")
     pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
-    lines = [
-        "🗳️ **New PTR Filing**",
-        f"**{escape_markdown(format_filer_name(row))}** ({row.get('StateDst', '?')})",
-        f"Filed: {filing_date}",
-        pdf_link,
+    name = escape_markdown(format_filer_name(row))
+    # Who filed leads: in a channel of these, the member is what a reader scans for.
+    lines = [f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure"]
+
+    if not transactions:
+        # An unreadable PDF is not an empty filing, and the alert has to say which.
+        lines += [
+            f"Filed {filing_date} · transactions could not be read from the PDF",
+            pdf_link,
+        ]
+        return "\n".join(lines)
+
+    buys = sum(1 for t in transactions if t["type"] == "Purchase")
+    sells = sum(1 for t in transactions if t["type"] == "Sale")
+    breakdown = ", ".join(
+        part for part in (plural(buys, "buy") if buys else "",
+                          plural(sells, "sell") if sells else "")
+        if part
+    )
+    lines.append(f"Filed {filing_date} · {plural(len(transactions), 'transaction')}"
+                 + (f" ({breakdown})" if breakdown else ""))
+    lines.append("")
+    lines += [
+        format_transaction(t, filing_date)
+        for t in sorted(transactions, key=lambda t: DIRECTION_ORDER.get(t["type"], 3))
     ]
-    if transactions:
-        lines.append("")
-        for t in transactions:
-            late = ""
-            if is_late_filing(t["txn_date"], filing_date):
-                delay = filing_delay_days(t["txn_date"], filing_date)
-                late = f" 🚨 LATE ({delay} days)"
-            partial = " partial" if t["partial"] else ""
-            lines.append(
-                f"- [{t['owner']}] {t['type']}{partial} -- "
-                f"{escape_markdown(describe_asset(t))} -- "
-                f"{t['txn_date']} -- {t['amount']}{late}"
-            )
-    else:
-        lines.append("_(could not auto-parse transaction details -- see PDF)_")
+    lines.append("")
+    if any_late(transactions, filing_date):
+        lines.append(LATE_LEGEND)
+    lines.append(f"Full PTR: {pdf_link}")
     return "\n".join(lines)
 
 

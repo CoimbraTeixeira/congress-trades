@@ -14,26 +14,26 @@ import requests
 from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
-    describe_asset,
     fetch_index_years,
     fetch_ptr_text,
-    filing_delay_days,
     filing_sort_key,
     index_years,
-    is_late_filing,
     member_key,
-    parse_date,
     parse_transactions,
 )
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
+    LATE_LEGEND,
     STATE_DIR,
     add_common_args,
+    any_late,
     baseline_docids,
     escape_markdown,
+    format_transaction,
     load_watch_state,
     load_webhook_url,
     log,
+    plural,
     save_watch_state,
     send_discord_message,
 )
@@ -54,32 +54,38 @@ def collapse_buys(buys: list[dict]) -> list[tuple[dict, int]]:
     return [(t, n) for t, n in grouped.values()]
 
 
-def build_message(member: dict, row: dict, buys: list[dict]) -> str:
+def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int) -> str:
     filing_date = row.get("FilingDate", "?")
     pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
-    headline = "just filed a new purchase:" if buys else (
-        "just filed a new PTR -- transaction details could not be auto-parsed:"
-    )
+    name = escape_markdown(member["member"])
+    collapsed = collapse_buys(buys)
+
     lines = [
-        "🚨 **Watchlist Buy Alert**",
-        f"**{escape_markdown(member['member'])}** ({member['state_dist']}) -- "
-        f"watchlist #{member['rank']} "
-        f"({member['return_pct_estimate']:+.1f}% est. return) {headline}",
-        "",
+        f"🚨 **{name}** ({member['state_dist']}) — watchlist buy",
+        # Rank alone ("watchlist #3") never said out of how many, or what the ranking
+        # measures; both fit in the line that establishes why this member is watched.
+        f"#{member['rank']} of {watchlist_size} on the watchlist · "
+        f"{member['return_pct_estimate']:+.1f}% estimated return",
     ]
-    for t, count in collapse_buys(buys):
-        partial = " partial" if t["partial"] else ""
-        repeat = f" x{count}" if count > 1 else ""
-        late = ""
-        if is_late_filing(t["txn_date"], filing_date):
-            late = f" 🚨 LATE ({filing_delay_days(t['txn_date'], filing_date)} days)"
-        lines.append(
-            f"- [{t['owner']}]{partial} {escape_markdown(describe_asset(t))}{repeat} -- "
-            f"{t['txn_date']} -- {t['amount']}{late}"
-        )
     if not buys:
-        lines.append("_(see the PDF)_")
-    lines += ["", f"Filed: {filing_date}", pdf_link]
+        # Silence here would read as "this filing had no purchases", which is the one
+        # thing it does not mean.
+        lines += [
+            f"Filed {filing_date} · transactions could not be read from the PDF, so "
+            f"this may or may not contain a buy",
+            pdf_link,
+        ]
+        return "\n".join(lines)
+
+    # Count the disclosed rows, not the collapsed lines -- the ×N on a line is what
+    # reconciles the two, so a header saying "3 purchases" above a "×2" would not add up.
+    lines += [f"Filed {filing_date} · {plural(len(buys), 'purchase')}", ""]
+    lines += [format_transaction(t, filing_date, show_direction=False, count=n)
+              for t, n in collapsed]
+    lines.append("")
+    if any_late(buys, filing_date):
+        lines.append(LATE_LEGEND)
+    lines.append(f"Full PTR: {pdf_link}")
     return "\n".join(lines)
 
 
@@ -163,7 +169,7 @@ def main() -> None:
         # it is indistinguishable from "nothing happened", so send it with a link instead
         # and let the reader open the PDF.
         if buys or not transactions:
-            message = build_message(member, row, buys)
+            message = build_message(member, row, buys, len(watched_by_key))
             if args.verbose or args.dry_run:
                 print(message)
                 print("---")

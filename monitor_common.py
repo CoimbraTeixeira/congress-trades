@@ -1,7 +1,9 @@
-"""Shared plumbing for the Discord monitors: webhook config, seen-doc state, delivery."""
+"""Shared plumbing for the Discord monitors: webhook config, seen-doc state, delivery,
+and the formatting every alert renders its transactions with."""
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -9,7 +11,14 @@ from pathlib import Path
 
 import requests
 
-from house_disclosures import member_key, parse_date
+from house_disclosures import (
+    LATE_FILING_DAYS,
+    clean_asset_name,
+    filing_delay_days,
+    is_late_filing,
+    member_key,
+    parse_date,
+)
 
 REPO_DIR = Path(__file__).resolve().parent
 STATE_DIR = REPO_DIR / "state"
@@ -151,6 +160,151 @@ def escape_markdown(text: str) -> str:
     for char in ("\\", "*", "_", "~", "`", "|"):
         text = text.replace(char, "\\" + char)
     return text
+
+
+# --- Transaction rendering ---------------------------------------------------------
+#
+# One formatter shared by all three alerts, so a transaction reads the same wherever it
+# turns up. The filing's own vocabulary is the thing being translated: it labels the
+# account holder `SP`, the asset class `[GS]`, and the size as `$15,001 - $50,000`, none
+# of which mean anything to someone reading a phone notification.
+
+# `self` is the default and says nothing worth a word in the line.
+OWNER_LABELS = {"SP": "spouse", "DC": "child", "JT": "joint"}
+
+# Asset classes worth naming, because "bought a Treasury note" and "bought Nvidia" are
+# different events and the filing distinguishes them only by a two-letter code. Stocks
+# carry no tag -- they are the assumed case -- and an unrecognised code is dropped rather
+# than shown raw, since a bare `[VI]` is no better than nothing.
+ASSET_TYPE_LABELS = {
+    "AB": "asset-backed", "CS": "corporate bond", "CT": "crypto", "EF": "ETF",
+    "ET": "ETN", "FE": "currency", "FN": "annuity", "FU": "futures", "GS": "govt bond",
+    "HE": "hedge fund", "IP": "royalties", "MF": "fund", "OI": "private co",
+    "OL": "private co", "OP": "option", "RE": "REIT", "RP": "real estate",
+    "SA": "stock rights", "VA": "annuity",
+}
+
+DIRECTION_LABELS = {
+    "Purchase": "🟢 **BUY**",
+    "Sale": "🔴 **SELL**",
+    "Exchange": "🔁 **EXCH**",
+}
+
+# The clock marks a filing that missed the STOCK Act deadline. It is explained once at the
+# foot of a message rather than in every line: the explanation is longer than the fact.
+LATE_MARK = "⏰"
+LATE_LEGEND = (f"_{LATE_MARK} = disclosed more than {LATE_FILING_DAYS} days after the "
+               f"trade, past the STOCK Act deadline (number shown is days taken)_")
+
+# Long enough to recognise a company, short enough that a line stays one line on a phone.
+MAX_ASSET_NAME = 38
+
+_DOLLAR_RE = re.compile(r"\$[\d,]+")
+
+# Corporate suffixes carry no information once the ticker is on the line, and they are
+# what pushes "International Business Machines Corporation" past the width where a name
+# gets cut. Display only -- clean_asset_name() feeds the ticker lookup, where the legal
+# form does help disambiguate.
+_LEGAL_SUFFIX_RE = re.compile(
+    r"[\s,]+(?:Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|LLC|L\.?P|"
+    r"PLC|N\.?V|S\.?A|A[/\s]?S|Holdings?|Group|Trust)\b\.?",
+    re.I,
+)
+
+
+def plural(count: int, noun: str, suffix: str = "s") -> str:
+    """"1 filing" / "2 filings" -- the old "filing(s)" everywhere read like a form letter."""
+    return f"{count} {noun}{'' if count == 1 else suffix}"
+
+
+def compact_dollars(value: float) -> str:
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:g}M"
+    if value >= 1_000:
+        return f"${round(value / 1_000):g}k"
+    return f"${value:,.0f}"
+
+
+def format_amount(amount: str) -> str:
+    """`$15,001 - $50,000` -> `$15k-$50k`.
+
+    The STOCK Act only ever discloses a bracket, and the brackets are conventionally
+    quoted by their round bounds; the exact `,001` is an artefact of how they abut, not
+    information. An amount that doesn't parse is passed through rather than guessed at."""
+    values = [int(v.lstrip("$").replace(",", "")) for v in _DOLLAR_RE.findall(amount or "")]
+    if not values:
+        return amount.strip() if amount else "amount not disclosed"
+    if len(values) == 1:
+        # The top bracket is open-ended ("Over $50,000,000") and has no upper bound.
+        prefix = "over " if "over" in amount.lower() else ""
+        return prefix + compact_dollars(values[0])
+    return f"{compact_dollars(values[0])}-{compact_dollars(values[1])}"
+
+
+def format_owner(owner: str | None) -> str:
+    """`SP` -> `spouse`. Empty for the filer's own account, which needs no saying."""
+    return OWNER_LABELS.get(owner or "", "")
+
+
+def shorten(text: str, limit: int = MAX_ASSET_NAME) -> str:
+    """Trim on a word boundary. Cutting mid-word produced things like `US Treasury Note
+    3.5% DU`, which reads as a parser bug rather than an abbreviation."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0] or text[:limit]
+    return cut.rstrip(" ,.-") + "…"
+
+
+def format_asset(txn: dict, *, limit: int = MAX_ASSET_NAME) -> str:
+    """`**AWK** American Water Works Company` -- ticker first.
+
+    The filing prints the ticker at the tail of a long legal name (`American Water Works
+    Company, Inc. Common Stock (AWK)`), which is the wrong way round for scanning: the
+    ticker is the identifier a reader is looking for, and the name is context."""
+    ticker = txn.get("ticker")
+    raw = txn.get("asset", "") or ""
+    name = clean_asset_name(raw) or raw
+    # Only worth dropping the legal form when the ticker already identifies the company;
+    # for an untickered bond or fund the full name is all the reader has.
+    if ticker:
+        name = _LEGAL_SUFFIX_RE.sub("", name).strip(" ,.-") or name
+    name = shorten(name, limit)
+    label = escape_markdown(name)
+    if ticker:
+        return f"**{escape_markdown(ticker)}** {label}".strip()
+    return label or "_(unnamed asset)_"
+
+
+def format_transaction(txn: dict, filing_date: str, *,
+                       show_direction: bool = True, count: int = 1) -> str:
+    """One transaction as a single scannable line, most-important-first: what direction,
+    what asset, how much, when it happened. Everything after that is a qualifier."""
+    parts = []
+    if show_direction:
+        parts.append(DIRECTION_LABELS.get(txn.get("type"), f"**{txn.get('type', '?')}**"))
+
+    asset = format_asset(txn)
+    type_label = ASSET_TYPE_LABELS.get(txn.get("asset_type") or "")
+    if type_label:
+        asset += f" [{type_label}]"
+    if count > 1:
+        asset += f" ×{count}"  # one row per account; the same trade, disclosed N times
+    parts.append(asset)
+
+    tail = [format_amount(txn.get("amount", "")), f"traded {txn.get('txn_date', '?')}"]
+    owner = format_owner(txn.get("owner"))
+    if owner:
+        tail.append(owner)
+    if txn.get("partial"):
+        tail.append("partial")
+    if is_late_filing(txn.get("txn_date", ""), filing_date):
+        tail.append(f"{LATE_MARK} {filing_delay_days(txn['txn_date'], filing_date)}d")
+
+    return " ".join(parts) + " · " + " · ".join(tail)
+
+
+def any_late(transactions: list[dict], filing_date: str) -> bool:
+    return any(is_late_filing(t.get("txn_date", ""), filing_date) for t in transactions)
 
 
 def split_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:

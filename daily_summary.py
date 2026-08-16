@@ -37,12 +37,15 @@ from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
     STATE_DIR,
     baseline_docids,
+    compact_dollars,
     escape_markdown,
     load_watch_state,
     load_webhook_url,
     log,
+    plural,
     save_watch_state,
     send_discord_message,
+    shorten,
     split_message,
 )
 
@@ -60,14 +63,9 @@ MAX_DIGEST_MESSAGES = 3
 TRUNCATION_MARKER = "\n_(truncated)_"
 MAX_TICKERS_PER_LINE = 8
 FETCH_WORKERS = 6
-
-
-def fmt_dollars(value: float) -> str:
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.1f}M"
-    if value >= 1_000:
-        return f"${value / 1_000:.0f}k"
-    return f"${value:.0f}"
+# An untickered asset (a bond, a fund) is labelled by name. Short enough to sit several
+# to a line, and cut on a word boundary so it reads as an abbreviation and not a bug.
+MAX_LABEL_CHARS = 22
 
 
 def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
@@ -96,20 +94,21 @@ def summarise_filing(transactions: list[dict]) -> dict:
         bucket = buys if t["type"] == "Purchase" else sells if t["type"] == "Sale" else None
         if bucket is None:  # Exchange -- counted in the totals, not as a direction
             continue
-        label = t["ticker"] or clean_asset_name(t["asset"])[:24] or "?"
+        label = t["ticker"] or shorten(clean_asset_name(t["asset"]), MAX_LABEL_CHARS) or "?"
         bucket[label][0] += 1
         bucket[label][1] += amount_midpoint(t["amount"]) or 0.0
     return {"buys": dict(buys), "sells": dict(sells)}
 
 
 def format_side(side: dict[str, list]) -> str:
-    """"NVDA x3 (~$24k), AMAT (~$8k)" -- biggest estimated dollars first."""
+    """"NVDA ×3 (~$24k), AMAT (~$8k)" -- biggest estimated dollars first."""
     # Most trades sit in the same disclosure bucket, so dollar totals tie constantly;
     # the label breaks ties to keep a daily report's ordering stable run to run.
     ranked = sorted(side.items(), key=lambda kv: (-kv[1][1], kv[0]))
     shown = ranked[:MAX_TICKERS_PER_LINE]
     parts = [
-        f"{label}{f' x{count}' if count > 1 else ''} (~{fmt_dollars(dollars)})"
+        f"{escape_markdown(label)}{f' ×{count}' if count > 1 else ''} "
+        f"(~{compact_dollars(dollars)})"
         for label, (count, dollars) in shown
     ]
     if len(ranked) > len(shown):
@@ -124,36 +123,39 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
     txn_count = sum(e["txn_count"] for e in entries)
     members = {e["member"]["member"] for e in entries}
 
-    scope = f"top {covered} by {scope_label}"
+    scope = f"Covering the top {covered} members by {scope_label}"
     if covered < requested:
         # Say why rather than quietly reporting on fewer people than were asked for.
-        scope += f" (of {requested} requested; only {covered} qualify)"
+        scope += f" — {requested} were requested, but only {covered} qualify"
 
     lines = [
-        f"📊 **Daily Congress Trade Summary** -- {now:%Y-%m-%d}",
-        f"_{scope} · {len(entries)} new filing(s) from {len(members)} member(s) · "
-        f"{txn_count} transaction(s)_",
-        f"Est. bought {fmt_dollars(total_buy)} · Est. sold {fmt_dollars(total_sell)}",
+        f"📊 **Daily Congress Trade Summary** — {now:%Y-%m-%d}",
+        f"{plural(len(entries), 'new filing')} from {plural(len(members), 'member')} · "
+        f"{plural(txn_count, 'transaction')}",
+        # Naming the estimate inline saves a reader wondering why the totals are round:
+        # the filings disclose a bracket, never an amount.
+        f"Bought ~{compact_dollars(total_buy)} · sold ~{compact_dollars(total_sell)} "
+        f"(midpoints of the disclosed ranges)",
+        f"_{scope}_",
     ]
 
-    rollup = most_traded(entries)
+    rollup = most_traded(entries, len(members))
     if rollup:
         lines += ["", *rollup]
 
     for entry in sorted(entries, key=lambda e: e["member"].get("rank", 0)):
         member, summary = entry["member"], entry["summary"]
-        rank = f"#{member['rank']}"
         ret = member.get("return_pct_estimate")
-        ret_label = f", {ret:+.1f}%" if ret is not None else ""
-        lines += ["", f"**{escape_markdown(member['member'])}** "
-                      f"({member['state_dist']}, {rank}{ret_label})"]
+        ret_label = f" · {ret:+.1f}% est. return" if ret is not None else ""
+        lines += ["", f"**{escape_markdown(member['member'])}** · "
+                      f"{member['state_dist']} · #{member['rank']}{ret_label}"]
         if summary["buys"]:
-            lines.append(f"  🟢 BUY  {format_side(summary['buys'])}")
+            lines.append(f"🟢 **BOUGHT** {format_side(summary['buys'])}")
         if summary["sells"]:
-            lines.append(f"  🔴 SELL {format_side(summary['sells'])}")
+            lines.append(f"🔴 **SOLD** {format_side(summary['sells'])}")
         if not summary["buys"] and not summary["sells"]:
-            lines.append("  _(no transactions parsed -- see PDF)_")
-        lines.append(f"  {entry['pdf_link']}")
+            lines.append("_(transactions could not be read from the PDF)_")
+        lines.append(entry["pdf_link"])
 
     return truncate_to_messages("\n".join(lines))
 
@@ -172,9 +174,12 @@ def truncate_to_messages(text: str) -> str:
     return kept[:budget].rsplit("\n", 1)[0] + TRUNCATION_MARKER
 
 
-def most_traded(entries: list[dict]) -> list[str]:
+def most_traded(entries: list[dict], filer_count: int) -> list[str]:
     """Tickers several members touched the same day -- the point of a digest over
-    per-filing alerts is that clustering only shows up when you look across members."""
+    per-filing alerts is that clustering only shows up when you look across members.
+
+    The count is reported against the number of members who filed at all, because "2
+    members" is a striking number out of thirty and an unremarkable one out of two."""
     buyers: dict[str, set] = defaultdict(set)
     sellers: dict[str, set] = defaultdict(set)
     for entry in entries:
@@ -185,12 +190,13 @@ def most_traded(entries: list[dict]) -> list[str]:
             sellers[label].add(who)
 
     lines = []
-    for verb, tally in (("Most bought", buyers), ("Most sold", sellers)):
+    for marker, verb, tally in (("🟢", "bought", buyers), ("🔴", "sold", sellers)):
         shared = sorted(((t, len(w)) for t, w in tally.items() if len(w) > 1),
                         key=lambda kv: (-kv[1], kv[0]))[:5]
         if shared:
-            lines.append(f"**{verb}:** "
-                         + ", ".join(f"{escape_markdown(t)} ({n} members)" for t, n in shared))
+            lines.append(f"{marker} **{verb.capitalize()} by more than one member:** "
+                         + ", ".join(f"{escape_markdown(t)} ({n} of {filer_count})"
+                                     for t, n in shared))
     return lines
 
 

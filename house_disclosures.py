@@ -387,17 +387,6 @@ def format_filer_name(row: dict) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-def describe_asset(txn: dict) -> str:
-    """Display string for a transaction's asset. Most filings already print the ticker
-    in the asset name, so only append it when it isn't there -- otherwise the alert
-    reads "AT&T Inc. (T) (T)"."""
-    asset = txn.get("asset", "")
-    ticker = txn.get("ticker")
-    if ticker and f"({ticker})" not in asset:
-        return f"{asset} ({ticker})"
-    return asset
-
-
 def member_key(row: dict) -> tuple[str, str, str]:
     """Stable identity for a filer across index rows -- raw fields, not display name."""
     return (row.get("Last", ""), row.get("First", ""), row.get("StateDst", ""))

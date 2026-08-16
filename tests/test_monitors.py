@@ -24,8 +24,14 @@ from monitor_common import (  # noqa: E402
     MAX_RETRY_SLEEP,
     baseline_docids,
     escape_markdown,
+    format_amount,
+    format_asset,
+    format_owner,
+    format_transaction,
     is_within_window,
+    plural,
     send_discord_message,
+    shorten,
     split_message,
 )
 from watchlist_monitor import build_message, collapse_buys  # noqa: E402
@@ -117,31 +123,130 @@ class CollapseBuysTest(unittest.TestCase):
         self.assertEqual(len(collapse_buys(buys)), 2)
 
 
+class FormatAmountTest(unittest.TestCase):
+    def test_range_is_quoted_by_its_round_bounds(self):
+        self.assertEqual(format_amount("$15,001 - $50,000"), "$15k-$50k")
+        self.assertEqual(format_amount("$1,001 - $15,000"), "$1k-$15k")
+        self.assertEqual(format_amount("$1,000,001 - $5,000,000"), "$1M-$5M")
+
+    def test_open_ended_top_bracket_says_over(self):
+        self.assertEqual(format_amount("Over $50,000,000"), "over $50M")
+
+    def test_unparseable_amount_is_passed_through_not_guessed(self):
+        self.assertEqual(format_amount("see attachment"), "see attachment")
+        self.assertEqual(format_amount(""), "amount not disclosed")
+
+
+class FormatOwnerTest(unittest.TestCase):
+    def test_codes_become_words(self):
+        self.assertEqual(format_owner("SP"), "spouse")
+        self.assertEqual(format_owner("DC"), "child")
+        self.assertEqual(format_owner("JT"), "joint")
+
+    def test_the_filers_own_account_is_left_unsaid(self):
+        self.assertEqual(format_owner("self"), "")
+        self.assertEqual(format_owner(None), "")
+
+
+class ShortenTest(unittest.TestCase):
+    def test_short_text_is_untouched(self):
+        self.assertEqual(shorten("Acme Corp", 20), "Acme Corp")
+
+    def test_cut_lands_on_a_word_boundary(self):
+        # "US Treasury Note 3.5% DU" read as a parser bug rather than an abbreviation.
+        self.assertEqual(shorten("US Treasury Note 3.5% DUE 01/31/28", 24),
+                         "US Treasury Note 3.5%…")
+
+    def test_single_long_word_is_still_cut(self):
+        self.assertEqual(shorten("x" * 30, 10), "x" * 10 + "…")
+
+
+class FormatAssetTest(unittest.TestCase):
+    def test_ticker_leads_and_is_not_repeated_in_the_name(self):
+        self.assertEqual(format_asset(txn(asset="Acme Corp Common Stock (ACME)")),
+                         "**ACME** Acme")
+
+    def test_legal_suffix_is_dropped_when_a_ticker_identifies_the_company(self):
+        self.assertEqual(
+            format_asset(txn(ticker="IBM",
+                             asset="International Business Machines Corporation")),
+            "**IBM** International Business Machines")
+
+    def test_untickered_asset_keeps_its_full_name(self):
+        # A bond has no ticker, so the name is the only identifier the reader gets.
+        self.assertIn("US Treasury Note",
+                      format_asset(txn(ticker=None, asset="US Treasury Note 3.5%")))
+
+    def test_markdown_in_a_filing_name_is_neutralised(self):
+        self.assertIn(r"A\_B", format_asset(txn(ticker=None, asset="A_B")))
+
+
+class FormatTransactionTest(unittest.TestCase):
+    FILED = "7/26/2026"
+
+    def test_line_leads_with_direction_asset_and_size(self):
+        line = format_transaction(txn(), self.FILED)
+        self.assertTrue(line.startswith("🟢 **BUY** **ACME**"))
+        self.assertIn("$1k-$15k", line)
+        self.assertIn("traded 07/01/2026", line)
+
+    def test_owner_code_is_spelled_out(self):
+        self.assertIn("spouse", format_transaction(txn(owner="SP"), self.FILED))
+        self.assertNotIn("[SP]", format_transaction(txn(owner="SP"), self.FILED))
+
+    def test_non_equity_assets_are_tagged(self):
+        # Otherwise a Treasury note in a "buy alert" reads as a stock pick.
+        line = format_transaction(txn(asset_type="GS", ticker=None), self.FILED)
+        self.assertIn("[govt bond]", line)
+
+    def test_repeated_rows_are_marked_with_a_count(self):
+        self.assertIn("×3", format_transaction(txn(), self.FILED, count=3))
+
+    def test_late_filings_show_the_days_taken(self):
+        line = format_transaction(txn(txn_date="01/02/2026"), self.FILED)
+        self.assertIn("⏰ 205d", line)
+
+    def test_timely_filings_are_not_flagged(self):
+        self.assertNotIn("⏰", format_transaction(txn(txn_date="07/20/2026"), self.FILED))
+
+
+class PluralTest(unittest.TestCase):
+    def test_singular_and_plural_instead_of_a_parenthesised_s(self):
+        self.assertEqual(plural(1, "filing"), "1 filing")
+        self.assertEqual(plural(2, "filing"), "2 filings")
+
+
 class BuildMessageTest(unittest.TestCase):
     MEMBER = {"member": "Hon. Test Filer", "state_dist": "XX01",
               "return_pct_estimate": 12.5, "rank": 3}
     ROW = {"Year": "2026", "DocID": "20034963", "FilingDate": "7/26/2026"}
 
     def test_purchase_message_lists_the_buys(self):
-        msg = build_message(self.MEMBER, self.ROW, [txn()])
-        self.assertIn("watchlist #3", msg)
-        self.assertIn("+12.5% est. return", msg)
-        self.assertIn("Acme Corp (ACME)", msg)
+        msg = build_message(self.MEMBER, self.ROW, [txn()], 10)
+        self.assertIn("Hon. Test Filer", msg)
+        self.assertIn("**ACME**", msg)
         self.assertIn("20034963.pdf", msg)
+
+    def test_rank_states_what_it_is_out_of(self):
+        # "watchlist #3" never said out of how many, nor what the ranking measured.
+        msg = build_message(self.MEMBER, self.ROW, [txn()], 10)
+        self.assertIn("#3 of 10 on the watchlist", msg)
+        self.assertIn("+12.5% estimated return", msg)
 
     def test_unparseable_filing_still_produces_an_alert(self):
         # The whole point: no purchases parsed must not read as "no purchases made".
-        msg = build_message(self.MEMBER, self.ROW, [])
-        self.assertIn("could not be auto-parsed", msg)
+        msg = build_message(self.MEMBER, self.ROW, [], 10)
+        self.assertIn("could not be read from the PDF", msg)
         self.assertIn("20034963.pdf", msg)
 
-    def test_late_filings_are_flagged(self):
-        msg = build_message(self.MEMBER, self.ROW, [txn(txn_date="01/02/2026")])
-        self.assertIn("LATE", msg)
+    def test_late_filings_are_flagged_and_explained(self):
+        msg = build_message(self.MEMBER, self.ROW, [txn(txn_date="01/02/2026")], 10)
+        self.assertIn("⏰", msg)
+        self.assertIn("STOCK Act deadline", msg)
 
     def test_timely_filings_are_not_flagged(self):
-        msg = build_message(self.MEMBER, self.ROW, [txn(txn_date="07/20/2026")])
-        self.assertNotIn("LATE", msg)
+        msg = build_message(self.MEMBER, self.ROW, [txn(txn_date="07/20/2026")], 10)
+        self.assertNotIn("⏰", msg)
 
 
 class BaselineDocidsTest(unittest.TestCase):
@@ -219,7 +324,7 @@ class SummariseFilingTest(unittest.TestCase):
 class FormatSideTest(unittest.TestCase):
     def test_orders_by_dollars_and_marks_repeats(self):
         side = {"AAA": [1, 5000.0], "BBB": [3, 90000.0]}
-        self.assertEqual(format_side(side), "BBB x3 (~$90k), AAA (~$5k)")
+        self.assertEqual(format_side(side), "BBB ×3 (~$90k), AAA (~$5k)")
 
     def test_long_lists_are_capped_with_a_remainder(self):
         side = {f"T{i}": [1, float(100 - i)] for i in range(12)}
@@ -234,13 +339,18 @@ class MostTradedTest(unittest.TestCase):
 
     def test_reports_only_tickers_more_than_one_member_touched(self):
         entries = [self._entry("A", buys=["NVDA", "SOLO"]), self._entry("B", buys=["NVDA"])]
-        lines = most_traded(entries)
+        lines = most_traded(entries, 2)
         self.assertEqual(len(lines), 1)
-        self.assertIn("NVDA (2 members)", lines[0])
+        self.assertIn("NVDA (2 of 2)", lines[0])
         self.assertNotIn("SOLO", lines[0])
 
+    def test_count_is_reported_against_the_number_who_filed(self):
+        # "2 members" is striking out of thirty and unremarkable out of two.
+        entries = [self._entry("A", buys=["NVDA"]), self._entry("B", buys=["NVDA"])]
+        self.assertIn("NVDA (2 of 30)", most_traded(entries, 30)[0])
+
     def test_silent_when_nothing_clusters(self):
-        self.assertEqual(most_traded([self._entry("A", buys=["NVDA"])]), [])
+        self.assertEqual(most_traded([self._entry("A", buys=["NVDA"])], 1), [])
 
 
 class BuildDigestTest(unittest.TestCase):
@@ -257,15 +367,20 @@ class BuildDigestTest(unittest.TestCase):
 
     def test_digest_reports_scope_and_both_directions(self):
         msg = build_digest(self.NOW, [self._entry()], "est. return", 25, 25)
-        self.assertIn("top 25 by est. return", msg)
-        self.assertIn("BUY", msg)
-        self.assertIn("SELL", msg)
+        self.assertIn("top 25 members by est. return", msg)
+        self.assertIn("BOUGHT", msg)
+        self.assertIn("SOLD", msg)
         self.assertIn("20034963.pdf", msg)
+
+    def test_totals_say_they_are_range_midpoints(self):
+        # Every figure here is an estimate; the message should not imply otherwise.
+        self.assertIn("midpoints of the disclosed ranges",
+                      build_digest(self.NOW, [self._entry()], "est. return", 25, 25))
 
     def test_shortfall_against_the_requested_top_n_is_stated(self):
         # Asking for 50 when only 25 qualify must not silently report on 25.
         msg = build_digest(self.NOW, [self._entry()], "est. return", 25, 50)
-        self.assertIn("of 50 requested; only 25 qualify", msg)
+        self.assertIn("50 were requested, but only 25 qualify", msg)
 
     def test_no_shortfall_note_when_the_full_set_is_covered(self):
         msg = build_digest(self.NOW, [self._entry()], "est. return", 50, 50)
@@ -274,7 +389,7 @@ class BuildDigestTest(unittest.TestCase):
     def test_unparsed_filing_is_shown_rather_than_omitted(self):
         entry = dict(self._entry(), txn_count=0, summary=summarise_filing([]))
         msg = build_digest(self.NOW, [entry], "est. return", 25, 25)
-        self.assertIn("no transactions parsed", msg)
+        self.assertIn("could not be read from the PDF", msg)
 
     def test_oversized_digest_is_truncated(self):
         msg = build_digest(self.NOW, [self._entry()] * 400, "est. return", 50, 50)

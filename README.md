@@ -57,6 +57,32 @@ python3 watchlist_monitor.py --dry-run
 python3 daily_summary.py --dry-run
 ```
 
+## What an alert looks like
+
+```
+🗳️ **Hon. Shri Thanedar** (MI13) — new trade disclosure
+Filed 8/13/2026 · 2 transactions (2 sells)
+
+🔴 **SELL** **AAPL** Apple · $100k-$250k · traded 01/09/2026 · partial · ⏰ 216d
+🔴 **SELL** **MSTR** Strategy · $15k-$50k · traded 10/21/2025 · ⏰ 296d
+
+_⏰ = disclosed more than 45 days after the trade, past the STOCK Act deadline_
+Full PTR: https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20033910.pdf
+```
+
+The filing's own vocabulary is translated rather than passed through, because none of it
+means anything on a phone screen: owner code `SP` becomes `spouse`, asset class `[GS]`
+becomes `[govt bond]`, and `$15,001 - $50,000` becomes `$15k-$50k` — the disclosure is
+only ever a bracket, so the `,001` is an artefact of how the brackets abut, not a figure.
+Ticker leads the asset because that is what a reader scans for; the filing buries it at
+the end of a long legal name. Buys are grouped before sells, since the PDF's row order is
+however the filer's broker listed them. `⏰` marks a late disclosure and carries the days
+taken; the deadline it missed is stated once at the foot rather than in every line.
+
+A non-equity asset is tagged (`[govt bond]`, `[fund]`, `[crypto]`) so a Treasury note in a
+buy alert doesn't read as a stock pick — those are counted as trades but excluded from
+the leaderboard's returns, per *Reading the numbers* below.
+
 ## The daily digest
 
 `daily_summary.py` posts one Discord message a day covering the top-N leaderboard
