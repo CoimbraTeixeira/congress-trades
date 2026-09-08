@@ -1,0 +1,8 @@
+# Optional: semantic trade search (build_search_index.py + search_trades.py).
+# Heavier than the core monitors (pulls a CPU build of torch), so it is kept separate --
+# install only if you want vector search. yfinance is already a core requirement.
+#
+#   pip install -r requirements-search.txt
+#
+pymilvus[milvus_lite]>=3.0     # embedded Milvus Lite vector store (single-file, no server)
+sentence-transformers>=3.0     # BAAI/bge-small-en-v1.5 embeddings

@@ -9,4 +9,6 @@ rebuild.log
 leaderboard.json
 dashboard.html
 watchlist.json
+trades_index.db/
+ticker_meta.json
 .claude/
