@@ -14,6 +14,7 @@ import requests
 from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
+    equity_transactions,
     fetch_index_years,
     fetch_ptr_text,
     filing_sort_key,
@@ -60,12 +61,19 @@ def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int
     name = escape_markdown(member["member"])
     collapsed = collapse_buys(buys)
 
+    # Rank alone ("watchlist #3") never said out of how many, or what the ranking
+    # measures; both fit in the line that establishes why this member is watched.
+    # The raw return leads with the benchmark beside it, because a return quoted alone
+    # cannot be read: +12% is a good year or a bad one depending on what the index did.
+    standing = f"{member['return_pct_estimate']:+.1f}% estimated return"
+    alpha = member.get("alpha_pct_estimate")
+    bench_pct = member.get("benchmark_return_pct_estimate")
+    if alpha is not None and bench_pct is not None:
+        standing += (f" · {alpha:+.1f}% vs {member.get('benchmark', 'the benchmark')} "
+                     f"({bench_pct:+.1f}%)")
     lines = [
         f"🚨 **{name}** ({member['state_dist']}) — watchlist buy",
-        # Rank alone ("watchlist #3") never said out of how many, or what the ranking
-        # measures; both fit in the line that establishes why this member is watched.
-        f"#{member['rank']} of {watchlist_size} on the watchlist · "
-        f"{member['return_pct_estimate']:+.1f}% estimated return",
+        f"#{member['rank']} of {watchlist_size} on the watchlist · {standing}",
     ]
     if not buys:
         # Silence here would read as "this filing had no purchases", which is the one
@@ -101,8 +109,9 @@ def main() -> None:
     if not WATCHLIST_PATH.exists():
         sys.exit(f"Missing {WATCHLIST_PATH} -- run build_watchlist.py first")
     watchlist = json.loads(WATCHLIST_PATH.read_text())
+    benchmark = watchlist.get("benchmark_ticker") or "the benchmark"
     watched_by_key = {
-        (m["last"], m["first"], m["state_dist"]): dict(m, rank=rank)
+        (m["last"], m["first"], m["state_dist"]): dict(m, rank=rank, benchmark=benchmark)
         for rank, m in enumerate(watchlist["members"], start=1)
     }
 
@@ -164,10 +173,15 @@ def main() -> None:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = None
 
-        buys = [t for t in transactions if t["type"] == "Purchase"] if transactions else []
+        purchases = [t for t in transactions if t["type"] == "Purchase"] if transactions else []
+        # A watchlist member buying a Treasury note is not the signal this monitor exists
+        # for -- they are ranked on equity returns, so a bond purchase says nothing about
+        # why they are watched.
+        buys = purchases if args.all_assets else equity_transactions(purchases)
         # A filing we couldn't read is not a filing without purchases. Staying silent on
         # it is indistinguishable from "nothing happened", so send it with a link instead
-        # and let the reader open the PDF.
+        # and let the reader open the PDF. (`transactions` rather than `buys` is what
+        # separates the two: a bond-only filing was read perfectly well.)
         if buys or not transactions:
             message = build_message(member, row, buys, len(watched_by_key))
             if args.verbose or args.dry_run:

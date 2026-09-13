@@ -367,6 +367,15 @@ def seed_baseline(path: Path, doc_ids: set[str], label: str) -> None:
         f"sent. Future runs will alert on genuinely new filings.")
 
 
+def add_all_assets_arg(parser) -> None:
+    """Opt back in to the non-equity rows. Shared with daily_summary.py, which builds its
+    own parser rather than using add_common_args."""
+    parser.add_argument("--all-assets", action="store_true",
+                        help="Report every asset class. By default only stocks and stock "
+                             "options are alerted on; bonds, funds, crypto and the rest "
+                             "are filtered out")
+
+
 def add_common_args(parser) -> None:
     parser.add_argument("--verbose", action="store_true", help="Print per-filing debug info")
     parser.add_argument("--dry-run", action="store_true",
@@ -374,3 +383,4 @@ def add_common_args(parser) -> None:
     parser.add_argument("--max-alerts", type=int, default=DEFAULT_MAX_ALERTS,
                         help=f"Cap alerts per run (default {DEFAULT_MAX_ALERTS}); "
                              f"the remainder is left for the next run")
+    add_all_assets_arg(parser)

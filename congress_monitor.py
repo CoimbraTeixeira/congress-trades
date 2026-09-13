@@ -11,6 +11,7 @@ from house_disclosures import (
     PDF_URL_TMPL,
     PTR_FILING_TYPE,
     fetch_index_years,
+    equity_transactions,
     fetch_ptr_text,
     filing_sort_key,
     format_filer_name,
@@ -111,6 +112,7 @@ def main() -> None:
         print(f"-- {len(new_rows)} new PTR(s) to alert on --")
 
     sent = 0
+    skipped = 0
     for row in new_rows:
         doc_id = row["DocID"]
         try:
@@ -120,7 +122,22 @@ def main() -> None:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
 
-        message = build_message(row, transactions)
+        alertable = transactions if args.all_assets else equity_transactions(transactions)
+        # A filing we read fine that turned out to be all bonds and funds is handled, not
+        # failed: record it seen and say nothing. The unreadable case is the one that
+        # still alerts below, because "no stock trades" and "we could not tell" are
+        # different facts and only one of them is safe to keep quiet about.
+        if transactions and not alertable:
+            skipped += 1
+            if args.verbose or args.dry_run:
+                print(f"{doc_id}: {plural(len(transactions), 'transaction')}, "
+                      f"none of them stocks — skipped")
+            if not args.dry_run:
+                seen.add(doc_id)
+                save_seen_doc_ids(STATE_PATH, seen)
+            continue
+
+        message = build_message(row, alertable)
         if args.verbose or args.dry_run:
             print(message)
             print("---")
@@ -138,6 +155,7 @@ def main() -> None:
 
     verb = "Would send" if args.dry_run else "Sent"
     log(f"{verb} {sent} new PTR alert(s) out of {len(new_rows)} new filing(s)."
+        + (f" {skipped} had no stock transactions." if skipped else "")
         + (f" {backlog} deferred." if backlog else ""))
 
 

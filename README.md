@@ -12,6 +12,7 @@ prohibits bulk/automated access.
 
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-search.txt  # optional: semantic search (heavier, pulls torch)
 sudo apt install poppler-utils          # provides pdftotext, used to read the PDFs
 ```
 
@@ -39,12 +40,14 @@ the `core.hooksPath` line above is required once per clone. Bypass a false posit
 |---|---|
 | `house_disclosures.py` | Shared library: fetch the index, pull a PTR PDF, parse its transaction table |
 | `monitor_common.py` | Shared monitor plumbing: webhook config, seen-DocID state, Discord delivery |
-| `congress_monitor.py` | Alerts on **every** new PTR filing |
-| `build_leaderboard.py` | Estimates per-member returns → `leaderboard.json` |
+| `congress_monitor.py` | Alerts on **every** new PTR filing containing a stock trade |
+| `build_leaderboard.py` | Estimates per-member returns and alpha vs SPY → `leaderboard.json` |
 | `build_watchlist.py` | Snapshots the top-N ranked members → `watchlist.json` |
 | `watchlist_monitor.py` | Alerts only when a watchlist member files a **purchase** |
 | `daily_summary.py` | One consolidated daily digest of the top-N's trades, buys and sells |
 | `build_dashboard.py` | Renders `leaderboard.json` → self-contained `dashboard.html` |
+| `build_search_index.py` | Enriches tickers with sector + company, embeds trades → Milvus Lite `trades_index.db` |
+| `search_trades.py` | Semantic + filtered CLI search over the trade index |
 
 Typical order:
 
@@ -53,6 +56,7 @@ python3 congress_monitor.py --dry-run     # first run seeds a baseline, no alert
 python3 build_leaderboard.py              # ~1-2 min: fetches every PTR + prices
 python3 build_watchlist.py
 python3 build_dashboard.py
+python3 build_search_index.py             # optional: ~20s, builds the semantic search index
 python3 watchlist_monitor.py --dry-run
 python3 daily_summary.py --dry-run
 ```
@@ -71,17 +75,81 @@ Full PTR: https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20033910
 ```
 
 The filing's own vocabulary is translated rather than passed through, because none of it
-means anything on a phone screen: owner code `SP` becomes `spouse`, asset class `[GS]`
-becomes `[govt bond]`, and `$15,001 - $50,000` becomes `$15k-$50k` — the disclosure is
+means anything on a phone screen: owner code `SP` becomes `spouse`, asset class `[OP]`
+becomes `[option]`, and `$15,001 - $50,000` becomes `$15k-$50k` — the disclosure is
 only ever a bracket, so the `,001` is an artefact of how the brackets abut, not a figure.
 Ticker leads the asset because that is what a reader scans for; the filing buries it at
 the end of a long legal name. Buys are grouped before sells, since the PDF's row order is
 however the filer's broker listed them. `⏰` marks a late disclosure and carries the days
 taken; the deadline it missed is stated once at the foot rather than in every line.
 
-A non-equity asset is tagged (`[govt bond]`, `[fund]`, `[crypto]`) so a Treasury note in a
-buy alert doesn't read as a stock pick — those are counted as trades but excluded from
-the leaderboard's returns, per *Reading the numbers* below.
+## Stocks only
+
+**Every alert covers stocks and stock options only.** A PTR discloses a member's whole
+portfolio activity, and most of that volume is not a stock pick: Treasury notes, municipal
+bonds, agency paper, target-date funds, private credit vehicles. Across the 60 most recent
+PTRs that is 43 of 411 transaction rows, and it silences 15 of 51 readable filings outright
+— roughly a third of the alert traffic was somebody's bond ladder rolling over.
+
+The filing's own asset-type code decides it: `ST` (stock) and `OP` (option) alert, every
+other code is dropped. Where the PDF yields no code — it wraps onto a continuation line
+often enough to matter — a printed ticker stands in, so an untyped `(AAPL)` row still
+alerts and an untyped `US Treasury Note 3.5%` does not. A *known* non-equity code always
+wins over a ticker, which is what keeps `SpaceX (SPCX) [OT]` out: that's the filer's own
+shorthand for a private holding, not a listed symbol.
+
+A filing whose trades were all non-equity sends nothing and is recorded as handled. A
+filing whose **PDF wouldn't parse** is a different case and still alerts, because "no
+stock trades" and "we couldn't tell" must not look the same from the outside.
+
+Pass `--all-assets` to any of the three to get the unfiltered feed back:
+
+```bash
+python3 congress_monitor.py --dry-run --all-assets
+```
+
+Options still carry their `[option]` tag, since "bought Nvidia" and "bought Nvidia calls"
+are different events. Non-equities remain counted as trades in the leaderboard's volume
+figures and excluded from its returns, per *Reading the numbers* below — the filter is
+about what gets pushed to you, not about what the numbers are built from.
+
+## Semantic search
+
+`build_search_index.py` turns the leaderboard's trade history into a vector index you can
+query in plain English. It aggregates a member's repeat buys of a ticker into one position,
+enriches each ticker with its company name and sector (yfinance, cached in
+`ticker_meta.json`), embeds a sector-rich description with `BAAI/bge-small-en-v1.5`, and
+writes it to a local [Milvus Lite](https://milvus.io/docs/milvus_lite.md) store
+(`trades_index.db`) — a single file, no server. The deps are heavier than the monitors, so
+they live in their own file:
+
+```bash
+pip install -r requirements-search.txt
+python3 build_leaderboard.py         # produces leaderboard.json
+python3 build_search_index.py        # ~20s: enrich + embed + index
+```
+
+Then query it:
+
+```bash
+python3 search_trades.py "semiconductor and chip stocks"
+python3 search_trades.py "profitable tech bets" --sector Technology --min-gain 5000
+python3 search_trades.py "energy holdings" --sector Energy --held
+python3 search_trades.py --member Pelosi        # facet browse, no query
+python3 search_trades.py --top 10               # biggest gainers
+```
+
+The enrichment is what makes it work: a text embedder has no idea `NVDA` is a chip stock,
+but it understands "NVIDIA Corporation, a Technology company in Semiconductors", so
+"semiconductor stocks" retrieves the chip trades instead of whatever shares a ticker's
+letters. `--sector`, `--min-gain`/`--max-gain`, `--held`/`--sold` and `--member` add scalar
+filters that run alongside the vector query. **`--top` deliberately ignores the embedding:**
+ranking by dollar magnitude is a metadata sort, not something a text model can do — asking
+for "the biggest winning trade" in prose returns semantically-similar trades, not the
+largest, so that question is answered by sorting the `gain` field instead.
+
+`leaderboard.json`, `trades_index.db` and `ticker_meta.json` are all gitignored, regenerated
+artefacts.
 
 ## The daily digest
 
@@ -91,14 +159,15 @@ breakdown with PDF links. Where the two monitors alert per filing as it lands, t
 the once-a-day read across the wider field.
 
 ```bash
-python3 daily_summary.py --top 50                  # default
+python3 daily_summary.py --top 50                  # default: ranked by alpha
+python3 daily_summary.py --top 50 --rank-by return # raw return, ignoring the index
 python3 daily_summary.py --top 50 --rank-by volume # rank by dollars traded instead
 python3 daily_summary.py --post-empty              # post even on a quiet day
 ```
 
-**`--top 50` will usually cover fewer than 50 members.** Ranking by return needs a
-computable return, and most members are sell-only in a given year — as of the last
-build, 36 of 74 members have one at all and 25 clear the leaderboard's
+**`--top 50` will usually cover fewer than 50 members.** Ranking by alpha or return
+needs a computable return, and most members are sell-only in a given year — as of the
+last build, 79 members have a priced trade and 26 clear the leaderboard's
 `--min-invested`/`--min-trades` thresholds. The digest states the shortfall in its own
 header rather than quietly reporting on a smaller field. For a true 50, either use
 `--rank-by volume` (ranks by dollars traded, which every filer has) or lower the
@@ -109,10 +178,10 @@ publishes on its own schedule and a filing routinely appears days after its fili
 date, so a fixed 24-hour window would drop it. A quiet day posts nothing unless
 `--post-empty` is set.
 
-Both monitors take `--verbose`, `--dry-run` (print, don't post or record state) and
-`--max-alerts N` (default 25; the oldest N are handled and the excess is left for the
-next run rather than dropped). `watchlist_monitor.py` also takes `--baseline-window N`
-(default 7) — see below.
+Both monitors take `--verbose`, `--dry-run` (print, don't post or record state),
+`--all-assets` (see *Stocks only* above) and `--max-alerts N` (default 25; the oldest N
+are handled and the excess is left for the next run rather than dropped).
+`watchlist_monitor.py` also takes `--baseline-window N` (default 7) — see below.
 
 The first run of a monitor records every existing filing as "seen" and sends
 nothing, so you don't get alerted on the whole back catalogue. State lives in
@@ -133,6 +202,9 @@ silently costing alerts, and what they do now:
 - A **newly promoted** member's existing filings are baselined away so a watchlist
   rotation doesn't replay their back catalogue. But the trade that earned them the slot
   is often days old, so filings inside `--baseline-window` (default 7 days) still alert.
+- A filing containing **no stock trades** is silent by design — see *Stocks only* above.
+  A third of filings are in this category, so this is now the most common reason.
+  `--all-assets` turns it off.
 - A PTR whose **PDF won't fetch or parse** used to yield zero purchases, which is
   indistinguishable from a filing with no purchases in it. It now sends an alert saying
   so, with the link, rather than nothing.
@@ -169,6 +241,13 @@ a page break.
 silently not alerted (wrong index year, baselined on promotion, read as "no purchases"
 when it was really unreadable).
 
+`tests/test_leaderboard.py` covers the scoring engine: the FIFO matcher, the price
+lookup's boundaries, and the benchmark comparison. The parser had tests from the start
+and the scorer had none, which is how a trade dated before the fetched price window
+came to be priced at the first close of the filing year — silently wrong rather than
+merely missing, for 23% of matched lots. Both halves of that fix have a regression test
+here.
+
 ## Reading the numbers
 
 Every figure is an **estimate**, and the estimate is loose by construction. The
@@ -181,6 +260,18 @@ amount or a share count.
   gain is `shares × (sell_price − buy_price)`. (Matching in dollar space instead
   would net a buy's cost against a sale's proceeds — quoted at different prices,
   so not the same unit.)
+- Every lot is also scored against **SPY over its own holding window**, weighted by
+  the same dollars, giving `alpha_pct_estimate`. This is the ranking metric, and it is
+  the one that makes the return legible at all: +9% in a year the index returned +15%
+  is underperformance, and ranking on the raw figure promotes whoever held the most
+  beta rather than whoever picked well. Cisneros is the standing example — +7.5%
+  return, and SPY did +7.8% over the same windows.
+- The price window opens at the **earliest transaction actually disclosed**, not at
+  January 1. Filings routinely report prior-year trades (the 45-day deadline alone
+  guarantees it, and late filers stretch it to months), and a price outside the window
+  is reported as `unpriced_trades` rather than answered with the first close we happen
+  to hold. Anything older than five years is treated as unpriceable rather than
+  widening the fetch without bound.
 - Sales exceeding matched buys were opened before the window, have unknown cost
   basis, and are excluded. Many members are sell-only in a given year and so have
   no computable return at all.
@@ -194,6 +285,9 @@ amount or a share count.
 - Members are **ranked** only above `--min-invested` / `--min-trades` thresholds;
   otherwise a single lucky $15k trade tops the board. Unranked members still
   appear in `leaderboard.json` and greyed in the dashboard table.
+- `build_watchlist.py` and `daily_summary.py` both rank on alpha by default and take
+  `--rank-by return` to go back to the raw figure. A member whose lots the benchmark
+  could not price falls back to the raw return rather than dropping off the board.
 - Filers have up to 45 days to report, so recent trades may not appear yet.
 
 Not investment advice.

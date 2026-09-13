@@ -157,7 +157,7 @@ TEMPLATE = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Top 10 ranked members by estimated return</h2>
+    <h2 id="chart-heading">Top 10 ranked members by estimated alpha</h2>
     <div id="chart"></div>
   </div>
 
@@ -173,7 +173,9 @@ TEMPLATE = """<!doctype html>
             <th class="num" data-key="invested_total_estimate" tabindex="0" aria-sort="none">Est. Basis</th>
             <th class="num" data-key="realized_gain_estimate" tabindex="0" aria-sort="none">Realized</th>
             <th class="num" data-key="unrealized_gain_estimate" tabindex="0" aria-sort="none">Unrealized</th>
-            <th class="num" data-key="return_pct_estimate" tabindex="0" aria-sort="descending">Return %</th>
+            <th class="num" data-key="return_pct_estimate" tabindex="0" aria-sort="none">Return %</th>
+            <th class="num" data-key="benchmark_return_pct_estimate" tabindex="0" aria-sort="none">Index %</th>
+            <th class="num" data-key="alpha_pct_estimate" tabindex="0" aria-sort="descending">Alpha %</th>
           </tr>
         </thead>
         <tbody id="full-table-body"></tbody>
@@ -192,6 +194,11 @@ const MEMBERS = DATA.members || [];
 const RANKED = MEMBERS.filter(m => m.ranked);
 const PRICED = MEMBERS.filter(m => m.return_pct_estimate !== null);
 const TOTALS = DATA.totals || {};
+const BENCH = DATA.benchmark_ticker || 'the index';
+// Ranking metric. A member the benchmark could not be priced against falls back to the
+// raw return rather than dropping off the board.
+const score = m => m.alpha_pct_estimate !== null && m.alpha_pct_estimate !== undefined
+  ? m.alpha_pct_estimate : m.return_pct_estimate;
 
 const esc = s => String(s).replace(/[&<>"']/g, c => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -216,9 +223,13 @@ function renderHeader() {
           in share space.</li>
       <li><strong>Unrealized</strong> gains mark still-held shares to the latest close —
           hypothetical, not cashed out.</li>
-      <li><strong>Realized</strong> gains only count buy/sell pairs matched within
-          ${esc(DATA.year)}; sales of positions opened earlier have unknown cost basis and
-          are excluded.</li>
+      <li><strong>Realized</strong> gains only count buy/sell pairs where both sides were
+          disclosed; sales of positions opened before the disclosed history have unknown
+          cost basis and are excluded.</li>
+      <li><strong>Alpha</strong> is the estimated return less what ${esc(BENCH)} returned over
+          the <em>same holding windows</em>, weighted by the same dollars. It is the ranking
+          metric here: a raw return says nothing on its own, since +9% in a year the index
+          returned +15% is underperformance.</li>
       <li>${esc(TOTALS.tradeable_lines ?? 0)} of ${esc(TOTALS.transaction_lines ?? 0)}
           disclosed trade lines resolved to an equity ticker; the rest (treasuries, municipal
           bonds, funds, crypto) count toward activity but not toward gain estimates.</li>
@@ -229,15 +240,18 @@ function renderHeader() {
           House only; Senate disclosures aren't included.</li>
     </ul>`;
 
-  const avg = RANKED.length
-    ? RANKED.reduce((a, m) => a + m.return_pct_estimate, 0) / RANKED.length : 0;
+  const withAlpha = RANKED.filter(m => m.alpha_pct_estimate !== null &&
+                                       m.alpha_pct_estimate !== undefined);
+  const avgAlpha = withAlpha.length
+    ? withAlpha.reduce((a, m) => a + m.alpha_pct_estimate, 0) / withAlpha.length : 0;
+  const beat = withAlpha.filter(m => m.alpha_pct_estimate > 0).length;
   const top = RANKED[0];
   const tiles = [
     [RANKED.length, 'Ranked members'],
-    [PRICED.length, 'Members with priced trades'],
-    [top ? fmtPct(top.return_pct_estimate) : '—',
-     top ? `Top: ${top.member} (${top.state_dist})` : 'Top estimated return'],
-    [RANKED.length ? fmtPct(avg) : '—', 'Average return (ranked)'],
+    [top ? fmtPct(score(top)) : '—',
+     top ? `Top alpha: ${top.member} (${top.state_dist})` : 'Top estimated alpha'],
+    [withAlpha.length ? fmtPct(avgAlpha) : '—', `Average alpha vs ${BENCH} (ranked)`],
+    [withAlpha.length ? `${beat} / ${withAlpha.length}` : '—', `Beat ${BENCH}`],
   ];
   document.getElementById('stats').innerHTML = tiles.map(([v, l]) =>
     `<div><div class="stat-value">${esc(v)}</div><div class="stat-label">${esc(l)}</div></div>`
@@ -245,6 +259,8 @@ function renderHeader() {
 
   document.getElementById('table-heading').textContent =
     `All members with priced trades (${PRICED.length})`;
+  document.getElementById('chart-heading').textContent =
+    `Top 10 ranked members by estimated alpha vs ${BENCH}`;
 }
 
 function renderChart() {
@@ -254,16 +270,18 @@ function renderChart() {
     chart.innerHTML = '<p class="empty">No members met the ranking threshold.</p>';
     return;
   }
-  const maxAbs = Math.max(...top10.map(m => Math.abs(m.return_pct_estimate)), 1);
+  const maxAbs = Math.max(...top10.map(m => Math.abs(score(m))), 1);
   chart.innerHTML = top10.map((m, i) => {
-    const pct = m.return_pct_estimate;
+    const pct = score(m);
     const good = pct >= 0;
     const width = (Math.abs(pct) / maxAbs) * 50;
     const trades = m.trade_detail.map(t => {
       const when = t.sell_date ? `${esc(t.buy_date)} → ${esc(t.sell_date)}`
                                : `${esc(t.buy_date)} (open)`;
+      const vs = (t.benchmark_gain === null || t.benchmark_gain === undefined) ? ''
+        : ` (${esc(BENCH)} ${esc(fmtSigned(t.benchmark_gain))})`;
       return `<li>${esc(t.ticker)} — ${esc(t.type)} — ${when} — ` +
-             `${esc(fmtMoney(t.amount))} → ${esc(fmtSigned(t.gain))}</li>`;
+             `${esc(fmtMoney(t.amount))} → ${esc(fmtSigned(t.gain))}${vs}</li>`;
     }).join('');
     return `
       <div class="bar-row">
@@ -288,6 +306,10 @@ function attachTooltips(rows) {
     tip.innerHTML =
       `<div class="t-name">${esc(m.member)} (${esc(m.state_dist)})</div><dl>` +
       `<dt>Est. return</dt><dd>${esc(fmtPct(m.return_pct_estimate))}</dd>` +
+      (m.benchmark_return_pct_estimate === null || m.benchmark_return_pct_estimate === undefined
+        ? '' : `<dt>${esc(BENCH)}, same windows</dt>` +
+               `<dd>${esc(fmtPct(m.benchmark_return_pct_estimate))}</dd>` +
+               `<dt>Alpha</dt><dd>${esc(fmtPct(m.alpha_pct_estimate))}</dd>`) +
       `<dt>Est. cost basis</dt><dd>${esc(fmtMoney(m.invested_total_estimate))}</dd>` +
       `<dt>Realized</dt><dd>${esc(fmtSigned(m.realized_gain_estimate))}</dd>` +
       `<dt>Unrealized</dt><dd>${esc(fmtSigned(m.unrealized_gain_estimate))}</dd>` +
@@ -310,7 +332,7 @@ function attachTooltips(rows) {
   });
 }
 
-let sortKey = 'return_pct_estimate';
+let sortKey = 'alpha_pct_estimate';
 let sortDir = -1;
 
 function compare(a, b, key) {
@@ -335,6 +357,8 @@ function renderTable() {
       <td class="num">${esc(fmtSigned(m.realized_gain_estimate))}</td>
       <td class="num">${esc(fmtSigned(m.unrealized_gain_estimate))}</td>
       <td class="num"><span class="pill ${m.return_pct_estimate >= 0 ? 'good' : 'bad'}">${esc(fmtPct(m.return_pct_estimate))}</span></td>
+      <td class="num">${m.benchmark_return_pct_estimate === null || m.benchmark_return_pct_estimate === undefined ? '—' : esc(fmtPct(m.benchmark_return_pct_estimate))}</td>
+      <td class="num">${m.alpha_pct_estimate === null || m.alpha_pct_estimate === undefined ? '—' : `<span class="pill ${m.alpha_pct_estimate >= 0 ? 'good' : 'bad'}">${esc(fmtPct(m.alpha_pct_estimate))}</span>`}</td>
     </tr>`).join('');
 }
 

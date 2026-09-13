@@ -162,6 +162,28 @@ def resolve_ticker(txn: dict) -> str | None:
     return resolve_ticker_by_name(txn["asset"])
 
 
+def is_equity_transaction(txn: dict) -> bool:
+    """True if a transaction is a stock (or a stock option) rather than a bond, fund,
+    crypto or any of the other things a PTR discloses.
+
+    The filing's own asset-type code decides it. Where the PDF yielded no code -- it
+    wraps onto a continuation line often enough to matter -- a printed ticker stands in:
+    an untyped row with a ticker in parens is nearly always an equity, while an untyped
+    row without one is far more often a Treasury note or a fund whose name simply has no
+    ticker to print."""
+    asset_type = txn.get("asset_type")
+    if asset_type is None:
+        return bool(txn.get("ticker"))
+    return asset_type in EQUITY_ASSET_TYPES
+
+
+def equity_transactions(transactions: list[dict]) -> list[dict]:
+    """The stock trades in a filing. Members hold Treasuries, municipal bonds and target
+    date funds in volume, and those rows drown the equity trades that are the point of
+    watching at all."""
+    return [t for t in transactions if is_equity_transaction(t)]
+
+
 def fetch_index(year: int) -> list[dict]:
     resp = _session().get(INDEX_URL_TMPL.format(year=year), timeout=30)
     resp.raise_for_status()

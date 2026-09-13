@@ -13,6 +13,13 @@ Methodology (share-based FIFO, mark-to-market):
 - Sales exceeding matched buys (position opened before the window) have unknown cost
   basis and are excluded from gain calculations.
 - Unsold shares are marked to market at the latest close for an unrealized gain.
+- Every lot is also scored against SPY over its OWN holding window, dollar-weighted the
+  same way, giving an alpha estimate. Members are ranked on alpha rather than raw
+  return: +9% in a year the index returned +15% is underperformance, and ranking on the
+  raw figure promotes whoever held the most beta rather than whoever picked well.
+- The price window opens at the earliest transaction actually parsed, not January 1:
+  filings routinely disclose prior-year trades, and pricing those at the first close of
+  the filing year is silently wrong rather than merely missing.
 - Non-equity assets (government securities, funds, crypto) are excluded from gain
   calculations but still counted as trades.
 - Members below --min-invested / --min-trades are still emitted but flagged
@@ -25,7 +32,7 @@ import logging
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +45,7 @@ from house_disclosures import (
     fetch_ptr_text,
     format_filer_name,
     member_key,
+    parse_date,
     parse_transactions,
     resolve_ticker,
 )
@@ -48,9 +56,47 @@ YEAR = datetime.now(timezone.utc).year
 PRICE_BATCH_SIZE = 200
 FETCH_WORKERS = 8
 
+# The benchmark every member's return is measured against. A raw return says nothing on
+# its own: +9% in a year the index returned +15% is underperformance, and ranking on the
+# raw figure promotes whoever held the most beta in an up year.
+BENCHMARK_TICKER = "SPY"
+
+# Days of price history fetched before the earliest trade. PriceBook.on() rolls forward
+# to the next close, so a trade dated on a weekend or a holiday needs the window to open
+# strictly before it -- without the run-in the earliest trade of all would be the one
+# trade that falls off the front.
+PRICE_WINDOW_RUN_IN_DAYS = 7
+
+# A misparsed date should not drag a several-hundred-ticker download back a decade.
+# Anything older than this is treated as unpriceable rather than widening the window.
+MAX_PRICE_LOOKBACK_YEARS = 5
+
 # yfinance logs a multi-line block for every delisted/renamed ticker, which drowns the
 # run's own output. Delisted symbols are expected here and handled as "unpriced".
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
+def price_window_start(transactions: list[dict], year: int) -> str:
+    """The earliest date the price series has to cover, as an ISO date string.
+
+    A PTR's transactions routinely predate the year it was filed in: the 45-day
+    reporting deadline alone puts December trades in the next year's index, and late
+    filers stretch that to months. Opening the window at January 1 of the filing year
+    therefore leaves every prior-year trade without a price on its own date -- 23% of
+    matched lots when this was measured.
+
+    Derived from the trades actually parsed, floored at MAX_PRICE_LOOKBACK_YEARS so a
+    misparsed date cannot widen the download without bound, and backed off by
+    PRICE_WINDOW_RUN_IN_DAYS so the oldest trade still has a close to roll forward to.
+    """
+    floor = datetime(year - MAX_PRICE_LOOKBACK_YEARS, 1, 1)
+    default = datetime(year, 1, 1)
+    dates = [
+        d for d in (parse_date(t.get("txn_date", "")) for t in transactions)
+        if d is not None and d >= floor
+    ]
+    earliest = min(dates, default=default)
+    return (min(earliest, default) - timedelta(days=PRICE_WINDOW_RUN_IN_DAYS)).date().isoformat()
 
 
 class PriceBook:
@@ -98,13 +144,23 @@ class PriceBook:
         return series
 
     def on(self, ticker: str, date_str: str) -> float | None:
-        """Close on the given date, rolling forward past weekends and holidays."""
+        """Close on the given date, rolling forward past weekends and holidays.
+
+        A date *before* the series begins yields None rather than the first close we
+        happen to hold. Rolling forward is right for a weekend -- the next close is
+        days away -- but a trade predating the fetched window is not a weekend, and
+        searchsorted would silently answer it with a close months or years later. That
+        turns a price we do not have into a confident wrong one; the caller counts a
+        None as an unpriced trade, which is a fact a reader can discount.
+        """
         series = self._closes.get(self.yahoo_symbol(ticker))
         if series is None:
             return None
         try:
             target = pd.Timestamp(datetime.strptime(date_str, "%m/%d/%Y"))
         except ValueError:
+            return None
+        if target < series.index[0]:
             return None
         pos = series.index.searchsorted(target)
         if pos >= len(series):
@@ -155,6 +211,22 @@ def collect_transactions(ptr_rows: list[dict], verbose: bool) -> tuple[dict[tupl
     return by_member, parsed_count
 
 
+def benchmark_gain(prices: PriceBook, cost: float,
+                   start_date: str, end_date: str | None) -> float | None:
+    """What the same cost basis would have gained in the benchmark over the same window.
+
+    Held to the lot's own dates rather than to the calendar year, so a position opened in
+    March is compared against the index from March. Comparing every member against a
+    single year-to-date index figure would credit whoever simply held for longer.
+    """
+    start_price = prices.on(BENCHMARK_TICKER, start_date)
+    end_price = (prices.on(BENCHMARK_TICKER, end_date) if end_date
+                 else prices.latest(BENCHMARK_TICKER))
+    if not start_price or not end_price:
+        return None
+    return cost * (end_price / start_price - 1)
+
+
 def score_member(txns: list[dict], prices: PriceBook) -> dict:
     """FIFO-match a member's trades in share space and mark the remainder to market."""
     by_ticker = defaultdict(list)
@@ -162,6 +234,10 @@ def score_member(txns: list[dict], prices: PriceBook) -> dict:
         by_ticker[t["ticker"]].append(t)
 
     realized = unrealized = invested = 0.0
+    # Benchmark basis is tracked separately from `invested`: a lot the benchmark could
+    # not be priced over still counts as invested, and dividing its gain by the full
+    # basis would understate the index rather than leave it out.
+    bench_gain = bench_basis = 0.0
     priced_trades = unknown_basis = unpriced = 0
     detail = []
 
@@ -189,10 +265,15 @@ def score_member(txns: list[dict], prices: PriceBook) -> dict:
                 realized += gain
                 invested += cost
                 priced_trades += 1
+                bench = benchmark_gain(prices, cost, lot[2], t["txn_date"])
+                if bench is not None:
+                    bench_gain += bench
+                    bench_basis += cost
                 detail.append({
                     "ticker": ticker, "type": "realized",
                     "buy_date": lot[2], "sell_date": t["txn_date"],
                     "amount": round(cost, 2), "gain": round(gain, 2),
+                    "benchmark_gain": round(bench, 2) if bench is not None else None,
                 })
                 lot[0] -= matched
                 remaining -= matched
@@ -210,13 +291,24 @@ def score_member(txns: list[dict], prices: PriceBook) -> dict:
             unrealized += gain
             invested += cost
             priced_trades += 1
+            bench = benchmark_gain(prices, cost, buy_date, None)
+            if bench is not None:
+                bench_gain += bench
+                bench_basis += cost
             detail.append({
                 "ticker": ticker, "type": "unrealized",
                 "buy_date": buy_date, "sell_date": None,
                 "amount": round(cost, 2), "gain": round(gain, 2),
+                "benchmark_gain": round(bench, 2) if bench is not None else None,
             })
 
     total_gain = realized + unrealized
+    return_pct = total_gain / invested * 100 if invested else None
+    # The index return over the *same* holding windows, dollar-weighted the same way, so
+    # the difference is attributable to the picks rather than to time in the market.
+    bench_pct = bench_gain / bench_basis * 100 if bench_basis else None
+    alpha = (return_pct - bench_pct
+             if return_pct is not None and bench_pct is not None else None)
     return {
         "total_trades": len(txns),
         "priced_trades": priced_trades,
@@ -226,7 +318,11 @@ def score_member(txns: list[dict], prices: PriceBook) -> dict:
         "realized_gain_estimate": round(realized, 2),
         "unrealized_gain_estimate": round(unrealized, 2),
         "total_gain_estimate": round(total_gain, 2),
-        "return_pct_estimate": round(total_gain / invested * 100, 2) if invested else None,
+        "return_pct_estimate": round(return_pct, 2) if return_pct is not None else None,
+        "benchmark_ticker": BENCHMARK_TICKER,
+        "benchmark_gain_estimate": round(bench_gain, 2) if bench_basis else None,
+        "benchmark_return_pct_estimate": round(bench_pct, 2) if bench_pct is not None else None,
+        "alpha_pct_estimate": round(alpha, 2) if alpha is not None else None,
         "trade_detail": detail,
     }
 
@@ -269,12 +365,19 @@ def main() -> None:
     print(f"{sum(len(v) for v in tradeable.values())} Purchase/Sale line(s) across "
           f"{len(tickers)} ticker(s).", file=sys.stderr)
 
-    prices = PriceBook(
-        tickers,
-        start=f"{args.year}-01-01",
-        end=(now.date().isoformat()),
-    )
-    print(f"Priced {len(prices)}/{len(tickers)} ticker(s).", file=sys.stderr)
+    # The window opens at the oldest trade we actually hold, not at January 1: a filing
+    # indexed this year routinely discloses last year's trades, and a price the window
+    # does not cover is now reported as unpriced rather than silently answered with a
+    # later close.
+    all_txns = [t for txns in tradeable.values() for t in txns]
+    start = price_window_start(all_txns, args.year)
+    prices = PriceBook(tickers | {BENCHMARK_TICKER}, start=start,
+                       end=(now.date().isoformat()))
+    priced = sum(1 for t in tickers if t in prices)
+    print(f"Priced {priced}/{len(tickers)} ticker(s) from {start}.", file=sys.stderr)
+    if BENCHMARK_TICKER not in prices:
+        print(f"warning: {BENCHMARK_TICKER} did not price; returns will carry no "
+              f"benchmark comparison", file=sys.stderr)
 
     leaderboard = []
     for key, txns in tradeable.items():
@@ -291,7 +394,15 @@ def main() -> None:
         )
         leaderboard.append(entry)
 
-    leaderboard.sort(key=lambda m: (m["ranked"], m["return_pct_estimate"] or -1e9), reverse=True)
+    # Ordered by alpha where there is one: a raw return ranks a bull-market beta holder
+    # above a genuine stock picker. Members with no benchmarked lot fall back to the raw
+    # return rather than dropping out of the file.
+    leaderboard.sort(
+        key=lambda m: (m["ranked"],
+                       m["alpha_pct_estimate"] if m["alpha_pct_estimate"] is not None
+                       else (m["return_pct_estimate"] or -1e9)),
+        reverse=True,
+    )
 
     OUTPUT_PATH.write_text(json.dumps({
         "generated_at": now.isoformat(),
@@ -305,21 +416,30 @@ def main() -> None:
             "tickers": len(tickers),
             "tickers_priced": len(prices),
         },
+        "benchmark_ticker": BENCHMARK_TICKER,
+        "price_window_start": start,
         "methodology": (
             "Estimated shares = disclosed range midpoint / close on the transaction date; "
             "buys and sells FIFO-matched in share space for realized gains; unsold shares "
             "marked to the latest close. Unmatched sales (positions opened before the "
             "window) and non-equity assets are excluded from gain estimates but counted "
-            "as trades. Members below min_invested/min_trades are unranked."
+            "as trades. Members below min_invested/min_trades are unranked. "
+            f"alpha_pct_estimate is the return less what {BENCHMARK_TICKER} returned over "
+            "the same holding windows, dollar-weighted the same way."
         ),
         "members": leaderboard,
     }, indent=2))
     print(f"Wrote leaderboard for {len(leaderboard)} member(s) to {OUTPUT_PATH}", file=sys.stderr)
 
     ranked = [m for m in leaderboard if m["ranked"]]
-    print(f"\nTop 10 of {len(ranked)} ranked member(s) by estimated return %:")
+    print(f"\nTop 10 of {len(ranked)} ranked member(s) by estimated alpha vs "
+          f"{BENCHMARK_TICKER}:")
     for m in ranked[:10]:
-        print(f"  {m['return_pct_estimate']:+7.2f}%  {m['member']} ({m['state_dist']})  "
+        alpha = m["alpha_pct_estimate"]
+        alpha_label = f"{alpha:+7.2f}%" if alpha is not None else "      —"
+        print(f"  {alpha_label} alpha  ({m['return_pct_estimate']:+.2f}% vs "
+              f"{m['benchmark_return_pct_estimate']:+.2f}% {BENCHMARK_TICKER})  "
+              f"{m['member']} ({m['state_dist']})  "
               f"gain=${m['total_gain_estimate']:,.0f} on ~${m['invested_total_estimate']:,.0f} "
               f"({m['priced_trades']} priced trades)")
 

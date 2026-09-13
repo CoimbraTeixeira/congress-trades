@@ -17,7 +17,12 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from house_disclosures import filing_sort_key, index_years  # noqa: E402
+from house_disclosures import (  # noqa: E402
+    equity_transactions,
+    filing_sort_key,
+    index_years,
+    is_equity_transaction,
+)
 import monitor_common  # noqa: E402
 from monitor_common import (  # noqa: E402
     DISCORD_MESSAGE_LIMIT,
@@ -121,6 +126,41 @@ class CollapseBuysTest(unittest.TestCase):
     def test_same_ticker_different_date_is_not_merged(self):
         buys = [txn(txn_date="07/01/2026"), txn(txn_date="07/02/2026")]
         self.assertEqual(len(collapse_buys(buys)), 2)
+
+
+class EquityFilterTest(unittest.TestCase):
+    """The alerts are about stock picks. A member's Treasury ladder and target-date funds
+    file through the same PTRs and used to alert identically."""
+
+    def test_stocks_and_options_are_kept(self):
+        self.assertTrue(is_equity_transaction(txn(asset_type="ST")))
+        self.assertTrue(is_equity_transaction(txn(asset_type="OP")))
+
+    def test_bonds_are_dropped(self):
+        self.assertFalse(is_equity_transaction(
+            txn(asset_type="GS", ticker=None, asset="US Treasury Note 3.5%")))
+        self.assertFalse(is_equity_transaction(txn(asset_type="CS", ticker=None)))
+
+    def test_funds_and_crypto_are_dropped(self):
+        for code in ("EF", "MF", "CT", "RE", "HE", "RP"):
+            self.assertFalse(is_equity_transaction(txn(asset_type=code)), code)
+
+    def test_untyped_row_with_a_ticker_is_kept(self):
+        # The asset-type code wraps onto a continuation line often enough that dropping
+        # every untyped row would quietly cost real stock alerts.
+        self.assertTrue(is_equity_transaction(txn(asset_type=None, ticker="ACME")))
+
+    def test_untyped_row_without_a_ticker_is_dropped(self):
+        self.assertFalse(is_equity_transaction(
+            txn(asset_type=None, ticker=None, asset="US Treasury Note 3.5%")))
+
+    def test_filter_keeps_order_and_drops_only_non_equities(self):
+        rows = [txn(ticker="AAA"), txn(asset_type="GS", ticker=None), txn(ticker="BBB")]
+        self.assertEqual([t["ticker"] for t in equity_transactions(rows)], ["AAA", "BBB"])
+
+    def test_bond_only_filing_filters_to_nothing(self):
+        # Distinct from an unreadable filing, which parses to [] and must still alert.
+        self.assertEqual(equity_transactions([txn(asset_type="GS", ticker=None)]), [])
 
 
 class FormatAmountTest(unittest.TestCase):
@@ -233,6 +273,21 @@ class BuildMessageTest(unittest.TestCase):
         self.assertIn("#3 of 10 on the watchlist", msg)
         self.assertIn("+12.5% estimated return", msg)
 
+    def test_return_is_quoted_against_the_benchmark(self):
+        # A return alone cannot be read: +12.5% is a good year or a bad one depending
+        # entirely on what the index did over the same period.
+        member = dict(self.MEMBER, alpha_pct_estimate=4.5,
+                      benchmark_return_pct_estimate=8.0, benchmark="SPY")
+        msg = build_message(member, self.ROW, [txn()], 10)
+        self.assertIn("+12.5% estimated return", msg)
+        self.assertIn("+4.5% vs SPY (+8.0%)", msg)
+
+    def test_member_without_an_alpha_still_states_its_return(self):
+        # An unbenchmarked member drops the comparison rather than the whole line.
+        msg = build_message(self.MEMBER, self.ROW, [txn()], 10)
+        self.assertIn("+12.5% estimated return", msg)
+        self.assertNotIn(" vs ", msg)
+
     def test_unparseable_filing_still_produces_an_alert(self):
         # The whole point: no purchases parsed must not read as "no purchases made".
         msg = build_message(self.MEMBER, self.ROW, [], 10)
@@ -272,15 +327,26 @@ class BaselineDocidsTest(unittest.TestCase):
 
 
 class SelectMembersTest(unittest.TestCase):
+    # R1 returned less than R2 but beat the index; R2's 9% trailed a 12% index.
     LEADERBOARD = {"members": [
         {"member": "R1", "ranked": True, "return_pct_estimate": 5.0,
-         "invested_total_estimate": 100.0},
+         "alpha_pct_estimate": 3.0, "invested_total_estimate": 100.0},
         {"member": "R2", "ranked": True, "return_pct_estimate": 9.0,
-         "invested_total_estimate": 50.0},
+         "alpha_pct_estimate": -3.0, "invested_total_estimate": 50.0},
         {"member": "U1", "ranked": False, "return_pct_estimate": 99.0,
-         "invested_total_estimate": 900.0},
+         "alpha_pct_estimate": 90.0, "invested_total_estimate": 900.0},
         {"member": "U2", "ranked": False, "invested_total_estimate": 0.0},
     ]}
+
+    def test_alpha_mode_ranks_beating_the_index_above_a_bigger_raw_return(self):
+        # The whole reason alpha is the default: R2's +9% trailed the index it was
+        # earned in, and R1's +5% beat it.
+        picked = select_members(self.LEADERBOARD, 50, "alpha")
+        self.assertEqual([m["member"] for m in picked], ["R1", "R2"])
+
+    def test_alpha_mode_skips_members_with_no_benchmark(self):
+        board = {"members": [dict(self.LEADERBOARD["members"][0], alpha_pct_estimate=None)]}
+        self.assertEqual(select_members(board, 50, "alpha"), [])
 
     def test_return_mode_uses_ranked_members_only(self):
         # The unranked +99% member is a single lucky trade, not a top performer.

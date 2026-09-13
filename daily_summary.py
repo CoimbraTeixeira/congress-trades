@@ -26,6 +26,7 @@ from house_disclosures import (
     PTR_FILING_TYPE,
     amount_midpoint,
     clean_asset_name,
+    equity_transactions,
     fetch_index_years,
     fetch_ptr_text,
     filing_sort_key,
@@ -36,6 +37,7 @@ from house_disclosures import (
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
     STATE_DIR,
+    add_all_assets_arg,
     baseline_docids,
     compact_dollars,
     escape_markdown,
@@ -71,13 +73,20 @@ MAX_LABEL_CHARS = 22
 def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
     """The members whose filings this digest covers.
 
-    `return` ranks by estimated return, which is only defined for members who clear the
-    leaderboard's thresholds -- there are usually far fewer of those than the requested
-    top-N, because most members are sell-only in a given year and so have no computable
-    return at all. `volume` ranks by dollars traded, which every filer has.
+    `alpha` ranks by estimated return less what the benchmark did over the same holding
+    windows -- the default, because a raw return in a rising market ranks whoever held
+    the most beta above whoever picked well. `return` ranks by the raw figure. Both are
+    only defined for members who clear the leaderboard's thresholds, and there are
+    usually far fewer of those than the requested top-N, because most members are
+    sell-only in a given year and so have no computable return at all. `volume` ranks by
+    dollars traded, which every filer has.
     """
     members = leaderboard["members"]
-    if rank_by == "return":
+    if rank_by == "alpha":
+        pool = [m for m in members
+                if m.get("ranked") and m.get("alpha_pct_estimate") is not None]
+        key = lambda m: m["alpha_pct_estimate"]  # noqa: E731
+    elif rank_by == "return":
         pool = [m for m in members if m.get("ranked")]
         key = lambda m: m["return_pct_estimate"]  # noqa: E731
     else:
@@ -146,7 +155,12 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
     for entry in sorted(entries, key=lambda e: e["member"].get("rank", 0)):
         member, summary = entry["member"], entry["summary"]
         ret = member.get("return_pct_estimate")
+        alpha = member.get("alpha_pct_estimate")
         ret_label = f" · {ret:+.1f}% est. return" if ret is not None else ""
+        # The benchmark comparison is what makes the return legible, so it rides along
+        # wherever the return is printed.
+        if alpha is not None:
+            ret_label += f" ({alpha:+.1f}% vs index)"
         lines += ["", f"**{escape_markdown(member['member'])}** · "
                       f"{member['state_dist']} · #{member['rank']}{ret_label}"]
         if summary["buys"]:
@@ -204,14 +218,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--top", type=int, default=DEFAULT_TOP,
                         help=f"How many leaderboard members to cover (default {DEFAULT_TOP})")
-    parser.add_argument("--rank-by", choices=("return", "volume"), default="return",
-                        help="Rank the top-N by estimated return (ranked members only) "
-                             "or by dollars traded (every filer)")
+    parser.add_argument("--rank-by", choices=("alpha", "return", "volume"),
+                        default="alpha",
+                        help="Rank the top-N by estimated alpha against the benchmark "
+                             "(default) or raw estimated return -- both ranked members "
+                             "only -- or by dollars traded (every filer)")
     parser.add_argument("--baseline-window", type=int, default=DEFAULT_BASELINE_WINDOW_DAYS,
                         help="When a member enters the top-N, still report filings from "
                              "the last N days")
     parser.add_argument("--post-empty", action="store_true",
                         help="Post the digest even when no new filings landed")
+    add_all_assets_arg(parser)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the digest without posting or recording state")
@@ -272,23 +289,44 @@ def main() -> None:
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {row['DocID']}: {exc}", file=sys.stderr)
             transactions = []
+        reported = transactions if args.all_assets else equity_transactions(transactions)
         return {
             "member": covered_by_key[member_key(row)],
             "pdf_link": PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
-            "txn_count": len(transactions),
-            "summary": summarise_filing(transactions),
+            # Whether the PDF read at all, kept separate from whether it held any stock
+            # trades -- the digest prints "could not be read" off the first, and dropping
+            # a bond-only filing must not borrow that line.
+            "unreadable": not transactions,
+            "txn_count": len(reported),
+            "summary": summarise_filing(reported),
         }
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
         entries = list(pool.map(load, new_rows))
 
-    scope_label = "est. return" if args.rank_by == "return" else "dollars traded"
+    entries = [e for e in entries if e["txn_count"] or e["unreadable"]]
+    if not entries and not args.post_empty:
+        log(f"{plural(len(new_rows), 'new filing')} from the top {len(top_members)}, "
+            f"none with stock transactions; nothing to summarise.")
+        if not args.dry_run:
+            # Still handled -- leaving them unseen would re-fetch every PDF tomorrow.
+            seen |= {r["DocID"] for r in new_rows}
+            save_watch_state(STATE_PATH, seen, covered_members)
+        return
+
+    scope_label = {"alpha": "est. alpha", "return": "est. return"}.get(
+        args.rank_by, "dollars traded")
     message = build_digest(now, entries, scope_label, len(top_members), args.top)
     if args.verbose or args.dry_run:
         print(message)
 
+    # Count the filings the digest actually reports on, not everything read: with the
+    # stock filter on, those differ, and the digest's own header states the former.
+    filtered = len(new_rows) - len(entries)
+    tail = f" ({filtered} with no stock transactions)" if filtered else ""
+
     if args.dry_run:
-        log(f"Would post a digest covering {len(new_rows)} new filing(s).")
+        log(f"Would post a digest covering {plural(len(entries), 'new filing')}{tail}.")
         return
 
     try:
@@ -299,8 +337,8 @@ def main() -> None:
 
     seen |= {r["DocID"] for r in new_rows}
     save_watch_state(STATE_PATH, seen, covered_members)
-    log(f"Posted a digest covering {len(new_rows)} new filing(s) from the top "
-        f"{len(top_members)}.")
+    log(f"Posted a digest covering {plural(len(entries), 'new filing')}{tail} from the "
+        f"top {len(top_members)}.")
 
 
 if __name__ == "__main__":
