@@ -217,6 +217,21 @@ def plural(count: int, noun: str, suffix: str = "s") -> str:
     return f"{count} {noun}{'' if count == 1 else suffix}"
 
 
+def display_name(member: dict) -> str:
+    """'McCormick, Richard' from a leaderboard/watchlist member's identity fields.
+
+    Built from the clean `first`/`last` the leaderboard already carries rather than by
+    un-formatting the composed `member` string: stripping titles back out needs a
+    hardcoded honorific list, and anything missing from it (a stray 'Dr' that came from
+    the Suffix column) leaks through. Shared so the search index and the monitors that
+    look rows up in it agree on the spelling.
+    """
+    last, first = (member.get("last") or "").strip(), (member.get("first") or "").strip()
+    if last and first:
+        return f"{last}, {first}"
+    return last or first or (member.get("member") or "").strip()
+
+
 def compact_dollars(value: float) -> str:
     if value >= 1_000_000:
         return f"${value / 1_000_000:g}M"

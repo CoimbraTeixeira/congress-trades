@@ -16,11 +16,12 @@ by magnitude is a metadata sort, not something a text embedder can do.
 
 import argparse
 import sys
+from datetime import datetime, timezone
 
-from search_common import COLLECTION, embed_query, open_client
+from search_common import POSITIONS, embed_query, open_client, quote_literal
 
 FIELDS = ["member", "state", "company", "ticker", "sector",
-          "gain", "amount", "buys", "last_date", "realized"]
+          "gain", "amount", "buys", "last_date", "realized", "generated_at"]
 
 
 def build_filter(sector=None, min_gain=None, max_gain=None,
@@ -28,7 +29,7 @@ def build_filter(sector=None, min_gain=None, max_gain=None,
     """Compose a Milvus boolean expression from the CLI facets (empty string = no filter)."""
     clauses = []
     if sector:
-        clauses.append(f'sector == "{sector}"')
+        clauses.append(f"sector == {quote_literal(sector)}")
     if min_gain is not None:
         clauses.append(f"gain >= {min_gain}")
     if max_gain is not None:
@@ -38,8 +39,20 @@ def build_filter(sector=None, min_gain=None, max_gain=None,
     elif held is False:
         clauses.append("realized == True")
     if member:
-        clauses.append(f'member like "%{member}%"')
+        clauses.append(f"member like {quote_literal('%' + member + '%')}")
     return " && ".join(clauses)
+
+
+def freshness(rows: list[dict]) -> str:
+    """'(indexed 2026-09-12, 1 day old)' -- results look current whether or not they are,
+    so the index's own age has to be printed beside them."""
+    stamps = [r.get("generated_at", 0) for r in rows if r.get("generated_at")]
+    if not stamps:
+        return ""
+    built = datetime.fromtimestamp(max(stamps), timezone.utc)
+    days = (datetime.now(timezone.utc) - built).days
+    age = "today" if days < 1 else f"{days} day{'s' if days != 1 else ''} old"
+    return f"  (indexed {built:%Y-%m-%d}, {age})"
 
 
 def fmt(hit_entity: dict, score: float | None) -> str:
@@ -52,19 +65,21 @@ def fmt(hit_entity: dict, score: float | None) -> str:
 
 
 def run_top(client, args, flt):
-    rows = client.query(COLLECTION, filter=flt or "gain > 0",
+    rows = client.query(POSITIONS, filter=flt or "gain > 0",
                         output_fields=FIELDS, limit=16000)
     rows.sort(key=lambda r: r["gain"], reverse=True)
     print(f"Top {args.top} gainers"
-          + (f" (filter: {flt})" if flt else "") + ":")
+          + (f" (filter: {flt})" if flt else "") + ":" + freshness(rows))
     for r in rows[:args.top]:
         print(fmt(r, None))
 
 
 def run_search(client, args, flt):
-    res = client.search(COLLECTION, data=embed_query(args.query), limit=args.limit,
+    res = client.search(POSITIONS, data=embed_query(args.query), limit=args.limit,
                         filter=flt, output_fields=FIELDS)[0]
-    print(f'Results for "{args.query}"' + (f" (filter: {flt})" if flt else "") + ":")
+    entities = [h["entity"] for h in res]
+    print(f'Results for "{args.query}"' + (f" (filter: {flt})" if flt else "") + ":"
+          + freshness(entities))
     if not res:
         print("  (no matches)")
     for h in res:
@@ -91,7 +106,7 @@ def main() -> None:
 
     flt = build_filter(args.sector, args.min_gain, args.max_gain, args.held, args.member)
     client = open_client()
-    if not client.has_collection(COLLECTION):
+    if not client.has_collection(POSITIONS):
         sys.exit("no index found -- run build_search_index.py first")
 
     if args.top is not None:
@@ -99,9 +114,9 @@ def main() -> None:
     elif args.query:
         run_search(client, args, flt)
     elif flt:                                   # facet-only browse, ranked by gain
-        rows = client.query(COLLECTION, filter=flt, output_fields=FIELDS, limit=args.limit)
+        rows = client.query(POSITIONS, filter=flt, output_fields=FIELDS, limit=args.limit)
         rows.sort(key=lambda r: r["gain"], reverse=True)
-        print(f"Matches (filter: {flt}):")
+        print(f"Matches (filter: {flt}):" + freshness(rows))
         for r in rows:
             print(fmt(r, None))
     else:

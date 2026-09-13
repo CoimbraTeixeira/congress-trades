@@ -29,6 +29,7 @@ from monitor_common import (
     add_common_args,
     any_late,
     baseline_docids,
+    display_name,
     escape_markdown,
     format_transaction,
     load_watch_state,
@@ -38,6 +39,7 @@ from monitor_common import (
     save_watch_state,
     send_discord_message,
 )
+from search_common import THEME_SIMILARITY, ThemeIndex
 
 REPO_DIR = Path(__file__).resolve().parent
 WATCHLIST_PATH = REPO_DIR / "watchlist.json"
@@ -55,7 +57,40 @@ def collapse_buys(buys: list[dict]) -> list[tuple[dict, int]]:
     return [(t, n) for t, n in grouped.values()]
 
 
-def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int) -> str:
+def theme_note(index, member: dict, buys: list[dict]) -> str | None:
+    """One line placing this buy against what the member already owns.
+
+    The alert says who bought what; it never said whether that is more of the same or a
+    direction they have not traded before. An exact-ticker lookup cannot answer it -- it
+    has no way to know ENPH relates to FSLR -- so the comparison runs over the indexed
+    business-description vectors. Returns None whenever the index cannot speak to it,
+    because a missing context line is fine and a missing alert is not.
+    """
+    if index is None or not index.available:
+        return None
+    bought = index.known(t["ticker"] for t in buys if t.get("ticker"))
+    if not bought:
+        return None
+    held = [t for t in index.holdings(display_name(member)) if t not in bought]
+    if not held:
+        return None
+
+    nearest = [(tk, index.closest(tk, held)) for tk in bought]
+    ranked = sorted(((tk, m, s) for tk, ms in nearest if ms for m, s in [ms]),
+                    key=lambda x: -x[2])
+    if not ranked:
+        return None
+    ticker, like, score = ranked[0]
+    if score < THEME_SIMILARITY:
+        return (f"🧭 New direction — nothing in this member's {len(held)} existing "
+                f"position(s) resembles {escape_markdown(ticker)}")
+    theme = index.label([ticker, like])
+    return (f"🧭 More {escape_markdown(theme)} — {escape_markdown(ticker)} sits "
+            f"alongside their existing {escape_markdown(like)}")
+
+
+def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int,
+                  index=None) -> str:
     filing_date = row.get("FilingDate", "?")
     pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
     name = escape_markdown(member["member"])
@@ -90,6 +125,9 @@ def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int
     lines += [f"Filed {filing_date} · {plural(len(buys), 'purchase')}", ""]
     lines += [format_transaction(t, filing_date, show_direction=False, count=n)
               for t, n in collapsed]
+    note = theme_note(index, member, buys)
+    if note:
+        lines.append(note)
     lines.append("")
     if any_late(buys, filing_date):
         lines.append(LATE_LEGEND)
@@ -162,6 +200,9 @@ def main() -> None:
     if args.verbose:
         print(f"-- {len(new_rows)} new watchlist PTR(s) --")
 
+    # Built once per run, not per alert: it reads the whole ticker collection, and the
+    # vectors it needs are already in the store, so no embedding model is loaded here.
+    index = ThemeIndex()
     sent = 0
     for row in new_rows:
         doc_id = row["DocID"]
@@ -183,7 +224,7 @@ def main() -> None:
         # and let the reader open the PDF. (`transactions` rather than `buys` is what
         # separates the two: a bond-only filing was read perfectly well.)
         if buys or not transactions:
-            message = build_message(member, row, buys, len(watched_by_key))
+            message = build_message(member, row, buys, len(watched_by_key), index)
             if args.verbose or args.dry_run:
                 print(message)
                 print("---")

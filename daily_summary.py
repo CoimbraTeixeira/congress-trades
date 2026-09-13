@@ -50,6 +50,7 @@ from monitor_common import (
     shorten,
     split_message,
 )
+from search_common import ThemeIndex
 
 REPO_DIR = Path(__file__).resolve().parent
 LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
@@ -126,7 +127,7 @@ def format_side(side: dict[str, list]) -> str:
 
 
 def build_digest(now: datetime, entries: list[dict], scope_label: str,
-                 covered: int, requested: int) -> str:
+                 covered: int, requested: int, index=None) -> str:
     total_buy = sum(sum(d for _, d in e["summary"]["buys"].values()) for e in entries)
     total_sell = sum(sum(d for _, d in e["summary"]["sells"].values()) for e in entries)
     txn_count = sum(e["txn_count"] for e in entries)
@@ -149,6 +150,7 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
     ]
 
     rollup = most_traded(entries, len(members))
+    rollup += traded_themes(entries, index, len(members))
     if rollup:
         lines += ["", *rollup]
 
@@ -211,6 +213,46 @@ def most_traded(entries: list[dict], filer_count: int) -> list[str]:
             lines.append(f"{marker} **{verb.capitalize()} by more than one member:** "
                          + ", ".join(f"{escape_markdown(t)} ({n} of {filer_count})"
                                      for t, n in shared))
+    return lines
+
+
+def traded_themes(entries: list[dict], index, filer_count: int,
+                  max_themes: int = 3) -> list[str]:
+    """Groups of *different* tickers that mean the same thing, traded by several members.
+
+    most_traded() catches the same symbol filed by several people. This catches the case
+    it structurally cannot: six members buying NVDA, AMD, AVGO and TSM on the same day
+    share a theme and share no ticker, so an equality-based rollup reports nothing at all.
+
+    A theme has to span more than one member *and* more than one ticker, otherwise it is
+    either a repeat of the line above or a single position wearing a sector name.
+    """
+    if index is None or not index.available:
+        return []
+
+    lines = []
+    for marker, verb, side in (("🟢", "Bought", "buys"), ("🔴", "Sold", "sells")):
+        who: dict[str, set] = defaultdict(set)
+        dollars: dict[str, float] = defaultdict(float)
+        for entry in entries:
+            for label, (_, amount) in entry["summary"][side].items():
+                who[label].add(entry["member"]["member"])
+                dollars[label] += amount
+
+        themes = []
+        for name, tickers in index.themes(who.keys()):
+            members = set().union(*(who[t] for t in tickers))
+            if len(members) > 1 and len(tickers) > 1:
+                themes.append((name, tickers, len(members),
+                               sum(dollars[t] for t in tickers)))
+        themes.sort(key=lambda t: (-t[2], -t[3], t[0]))
+
+        for name, tickers, n, amount in themes[:max_themes]:
+            shown = ", ".join(escape_markdown(t) for t in tickers[:4])
+            more = f" +{len(tickers) - 4}" if len(tickers) > 4 else ""
+            lines.append(f"{marker} **{verb} across {escape_markdown(name)}:** "
+                         f"{n} of {filer_count} members, ~{compact_dollars(amount)} "
+                         f"({shown}{more})")
     return lines
 
 
@@ -316,7 +358,10 @@ def main() -> None:
 
     scope_label = {"alpha": "est. alpha", "return": "est. return"}.get(
         args.rank_by, "dollars traded")
-    message = build_digest(now, entries, scope_label, len(top_members), args.top)
+    # Optional: the digest is a report, not a search tool, so a missing or unbuilt index
+    # costs it the theme lines and nothing else.
+    message = build_digest(now, entries, scope_label, len(top_members), args.top,
+                           ThemeIndex())
     if args.verbose or args.dry_run:
         print(message)
 

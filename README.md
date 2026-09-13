@@ -43,11 +43,12 @@ the `core.hooksPath` line above is required once per clone. Bypass a false posit
 | `congress_monitor.py` | Alerts on **every** new PTR filing containing a stock trade |
 | `build_leaderboard.py` | Estimates per-member returns and alpha vs SPY → `leaderboard.json` |
 | `build_watchlist.py` | Snapshots the top-N ranked members → `watchlist.json` |
-| `watchlist_monitor.py` | Alerts only when a watchlist member files a **purchase** |
-| `daily_summary.py` | One consolidated daily digest of the top-N's trades, buys and sells |
+| `watchlist_monitor.py` | Alerts only when a watchlist member files a **purchase**, with a theme note when the index is built |
+| `daily_summary.py` | One consolidated daily digest of the top-N's trades, buys and sells, incl. themed roll-ups |
 | `build_dashboard.py` | Renders `leaderboard.json` → self-contained `dashboard.html` |
-| `build_search_index.py` | Enriches tickers with sector + company, embeds trades → Milvus Lite `trades_index.db` |
+| `build_search_index.py` | Embeds each ticker's business description → Milvus Lite `trades_index.db` (`tickers` + `positions`) |
 | `search_trades.py` | Semantic + filtered CLI search over the trade index |
+| `search_common.py` | Shared index plumbing: embeddings, clustering, and the read-only `ThemeIndex` the monitors use |
 
 Typical order:
 
@@ -116,12 +117,27 @@ about what gets pushed to you, not about what the numbers are built from.
 ## Semantic search
 
 `build_search_index.py` turns the leaderboard's trade history into a vector index you can
-query in plain English. It aggregates a member's repeat buys of a ticker into one position,
-enriches each ticker with its company name and sector (yfinance, cached in
-`ticker_meta.json`), embeds a sector-rich description with `BAAI/bge-small-en-v1.5`, and
-writes it to a local [Milvus Lite](https://milvus.io/docs/milvus_lite.md) store
-(`trades_index.db`) — a single file, no server. The deps are heavier than the monitors, so
-they live in their own file:
+query in plain English, and which the monitors read to add theme context to their alerts.
+It enriches each distinct ticker with its company name, sector and **business
+description** (yfinance, cached in `ticker_meta.json`), embeds that with
+`BAAI/bge-small-en-v1.5`, and writes two collections to a local
+[Milvus Lite](https://milvus.io/docs/milvus_lite.md) store (`trades_index.db`) — no server:
+
+| Collection | Rows | Vector |
+| --- | --- | --- |
+| `tickers` | one per symbol (~500) | the company's business description |
+| `positions` | one per member+ticker (~730) | a copy of its ticker's vector |
+
+Embedding the *business description* rather than a rendered sentence is the whole point.
+A sentence like "… invested in NVIDIA Corporation (NVDA), a Technology company …
+estimated gain $4231 …" wastes the vector twice: every row shares that skeleton, so the
+scores compress into a narrow band, and the dollar figures are exactly what a text
+embedder cannot represent. Describing the business instead means "clean energy" retrieves
+Enphase for what it *does*, while the dollar figures stay scalar columns for `--min-gain`
+to filter on. It also cuts the embedding work to one vector per symbol rather than one per
+member+ticker pair.
+
+The deps are heavier than the monitors, so they live in their own file:
 
 ```bash
 pip install -r requirements-search.txt
@@ -139,14 +155,37 @@ python3 search_trades.py --member Pelosi        # facet browse, no query
 python3 search_trades.py --top 10               # biggest gainers
 ```
 
-The enrichment is what makes it work: a text embedder has no idea `NVDA` is a chip stock,
-but it understands "NVIDIA Corporation, a Technology company in Semiconductors", so
-"semiconductor stocks" retrieves the chip trades instead of whatever shares a ticker's
-letters. `--sector`, `--min-gain`/`--max-gain`, `--held`/`--sold` and `--member` add scalar
-filters that run alongside the vector query. **`--top` deliberately ignores the embedding:**
-ranking by dollar magnitude is a metadata sort, not something a text model can do — asking
-for "the biggest winning trade" in prose returns semantically-similar trades, not the
-largest, so that question is answered by sorting the `gain` field instead.
+Similarity is measured on **mean-centred** vectors. Raw cosine is unusable here: every
+business summary shares the same corporate register, so unrelated pairs floor around 0.60
+and `INTC`/`MSFT` (0.75) outscore `NVDA`/`AMD` (0.74). Subtracting the corpus mean removes
+that common component — unrelated pairs fall to ~0.00 while same-industry pairs hold
+0.25–0.46, which is what makes a threshold meaningful at all.
+
+`--sector`, `--min-gain`/`--max-gain`, `--held`/`--sold` and `--member` add scalar filters
+that run alongside the vector query, and results carry the index's own build date so a
+stale answer says so. **`--top` deliberately ignores the embedding:** ranking by dollar
+magnitude is a metadata sort, not something a text model can do — asking for "the biggest
+winning trade" in prose returns semantically-similar trades, not the largest, so that
+question is answered by sorting the `gain` field instead.
+
+### Themes in the alerts
+
+The index is not only for the CLI. When it is present:
+
+- **`daily_summary.py`** adds a themed roll-up beside the most-traded line:
+  `🟢 Bought across Semiconductors: 4 of 4 members, ~$130k (NVDA, AMD, AVGO, MU)`.
+  The existing roll-up matches on *equality*, so four members buying four different chip
+  names share no ticker and produce no line at all. Clustering catches exactly that case,
+  and a denser digest is also less likely to hit the truncation ceiling.
+- **`watchlist_monitor.py`** places a buy against what the member already holds:
+  `🧭 More Healthcare — MRNA sits alongside their existing TEM`, or
+  `🧭 New direction — nothing in this member's 10 existing position(s) resembles XOM`.
+  An exact-ticker lookup cannot answer this; it has no way to know `ENPH` relates to `FSLR`.
+
+Both are **optional context**. The alert paths never load the embedding model — they read
+vectors already in the store — and a missing, unbuilt or unreadable index costs them the
+extra line and nothing else. A theme is also only named when its members genuinely share
+an industry, because a confident wrong label is worse than no label.
 
 `leaderboard.json`, `trades_index.db` and `ticker_meta.json` are all gitignored, regenerated
 artefacts.
@@ -214,7 +253,7 @@ silently costing alerts, and what they do now:
 ## Schedule
 
 ```cron
-30 12 * * * ( python3 build_leaderboard.py && python3 build_watchlist.py ) >> rebuild.log 2>&1
+30 12 * * * ( python3 build_leaderboard.py && python3 build_watchlist.py && python3 build_search_index.py ) >> rebuild.log 2>&1
  0 13 * * * python3 congress_monitor.py    >> monitor.log 2>&1
 30 13 * * * python3 watchlist_monitor.py   >> watchlist_monitor.log 2>&1
  0 14 * * * python3 daily_summary.py       >> summary.log 2>&1
@@ -225,6 +264,13 @@ leaderboard rather than whoever was ranked the day the files were last written b
 Because that rotates the membership daily, both the watchlist monitor and the digest
 record *last run's* membership and re-baseline anyone who leaves and comes back — a
 growing all-time set would replay a returning member's entire absence in one burst.
+
+`build_search_index.py` is last in the chain because it reads `leaderboard.json`. It is
+chained rather than scheduled separately so the index can never describe a leaderboard
+that no longer exists; if the search deps are not installed, drop that one command and the
+monitors simply run without theme lines. The rebuild writes to a staging store and swaps it
+into place only on success, so a failure leaves the previous index serving rather than
+deleting it and failing before the replacement is written.
 
 ## Tests
 

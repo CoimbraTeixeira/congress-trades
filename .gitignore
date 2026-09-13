@@ -12,3 +12,5 @@ watchlist.json
 trades_index.db/
 ticker_meta.json
 .claude/
+trades_index.*.db/
+trades_index.db.old/
