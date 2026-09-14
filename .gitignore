@@ -14,3 +14,4 @@ ticker_meta.json
 .claude/
 trades_index.*.db/
 trades_index.db.old/
+cache/

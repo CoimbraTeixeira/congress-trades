@@ -6,21 +6,27 @@ The fixture is real `pdftotext -layout` output stitched from three 2026 filings;
 block in it previously broke the line-oriented parser in a different way.
 """
 
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import house_disclosures  # noqa: E402
 from house_disclosures import (  # noqa: E402
     amount_midpoint,
     clean_asset_name,
+    fetch_ptr_text,
     filing_delay_days,
     format_filer_name,
     is_late_filing,
     member_key,
     parse_transactions,
     resolve_ticker,
+    trade_transactions,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ptr_sample.txt"
@@ -134,12 +140,126 @@ class HelpersTest(unittest.TestCase):
         row = {"Prefix": "Hon.", "First": "Jane", "Last": "Doe", "Suffix": ""}
         self.assertEqual(format_filer_name(row), "Hon. Jane Doe")
 
-    def test_member_key_uses_raw_fields(self):
-        row = {"Prefix": "Hon.", "First": "Jane", "Last": "Doe", "StateDst": "CA01"}
-        self.assertEqual(member_key(row), ("Doe", "Jane", "CA01"))
 
-    def test_member_key_tolerates_missing_fields(self):
-        self.assertEqual(member_key({}), ("", "", ""))
+class MemberIdentityTest(unittest.TestCase):
+    """Real pairs from the 2023-2026 archives that used to score as two members each,
+    splitting one record in half and spending two watchlist slots on one person."""
+
+    def test_a_title_added_mid_window_is_the_same_member(self):
+        self.assertEqual(
+            member_key({"Last": "Greene", "First": "Marjorie Taylor", "StateDst": "GA14"}),
+            member_key({"Last": "Greene", "First": "Marjorie Taylor Mrs", "StateDst": "GA14"}))
+
+    def test_an_irreconcilable_first_name_is_the_same_member(self):
+        self.assertEqual(
+            member_key({"Last": "Franklin", "First": "C. Scott", "StateDst": "FL18"}),
+            member_key({"Last": "Franklin", "First": "Scott Scott", "StateDst": "FL18"}))
+
+    def test_post_nominals_migrating_between_fields_is_the_same_member(self):
+        self.assertEqual(
+            member_key({"Last": "Dunn, MD, FACS", "First": "Neal Patrick", "StateDst": "FL02"}),
+            member_key({"Last": "Dunn", "First": "Neal Patrick MD, Facs", "StateDst": "FL02"}))
+
+    def test_same_surname_in_different_districts_stays_separate(self):
+        self.assertNotEqual(
+            member_key({"Last": "Moore", "First": "Tim", "StateDst": "NC14"}),
+            member_key({"Last": "Moore", "First": "Blake", "StateDst": "UT01"}))
+
+    def test_a_compound_surname_survives_normalization(self):
+        self.assertEqual(
+            member_key({"Last": "Van Drew", "First": "Jefferson", "StateDst": "NJ02"}),
+            ("van drew", "NJ02"))
+
+    def test_tolerates_missing_fields(self):
+        self.assertEqual(member_key({}), ("", ""))
+
+
+def _txn(kind: str, ticker: str = "AAA") -> dict:
+    return {"type": kind, "ticker": ticker, "txn_date": "01/05/2026",
+            "amount": "$1,001 - $15,000"}
+
+
+class TradeFilterTest(unittest.TestCase):
+    """Only buys and sells say anything about a pick, and all three readers -- the
+    leaderboard, the digest and the buy alerts -- have to agree on that."""
+
+    def test_purchases_and_sales_are_kept_in_order(self):
+        rows = [_txn("Purchase", "AAA"), _txn("Exchange", "BBB"), _txn("Sale", "CCC")]
+        self.assertEqual([t["ticker"] for t in trade_transactions(rows)], ["AAA", "CCC"])
+
+    def test_exchange_only_filing_filters_to_nothing(self):
+        # A share-class swap or a merger conversion: no direction, nothing to report.
+        self.assertEqual(trade_transactions([_txn("Exchange")]), [])
+
+    def test_a_row_with_no_type_at_all_is_dropped(self):
+        self.assertEqual(trade_transactions([{"ticker": "AAA"}]), [])
+
+
+class PtrTextCacheTest(unittest.TestCase):
+    """A published filing is immutable, and the 3-year window re-reads a few thousand of
+    them every rebuild. The cache is what keeps that off the Clerk's site -- but it must
+    never make a transient failure permanent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for patcher in (
+            mock.patch.object(house_disclosures, "PTR_TEXT_CACHE_DIR",
+                              Path(self.tmp.name)),
+            mock.patch.object(house_disclosures.shutil, "which",
+                              return_value="/usr/bin/pdftotext"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _session(status: int = 200, content: bytes = b"%PDF-1.4"):
+        resp = mock.Mock(status_code=status, content=content)
+        return mock.Mock(return_value=mock.Mock(get=mock.Mock(return_value=resp)))
+
+    def _extract(self, stdout: str, returncode: int = 0):
+        return mock.patch.object(
+            house_disclosures.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], returncode, stdout, ""))
+
+    def test_extracted_text_is_reused_without_refetching(self):
+        session = self._session()
+        with mock.patch.object(house_disclosures, "_session", session), \
+                self._extract("TRANSACTION TABLE"):
+            self.assertEqual(fetch_ptr_text(2026, "20033910"), "TRANSACTION TABLE")
+        with mock.patch.object(house_disclosures, "_session", session):
+            self.assertEqual(fetch_ptr_text(2026, "20033910"), "TRANSACTION TABLE")
+        self.assertEqual(session.return_value.get.call_count, 1)
+
+    def test_a_missing_pdf_is_not_cached_as_an_empty_filing(self):
+        with mock.patch.object(house_disclosures, "_session", self._session(status=404)):
+            self.assertIsNone(fetch_ptr_text(2026, "20033911"))
+        with mock.patch.object(house_disclosures, "_session", self._session()), \
+                self._extract("LATER TEXT"):
+            self.assertEqual(fetch_ptr_text(2026, "20033911"), "LATER TEXT")
+
+    def test_an_unreadable_pdf_is_not_cached(self):
+        with mock.patch.object(house_disclosures, "_session", self._session()), \
+                self._extract("", returncode=1):
+            self.assertIsNone(fetch_ptr_text(2026, "20033912"))
+        self.assertEqual(list(Path(self.tmp.name).rglob("*.txt")), [])
+
+    def test_no_cache_refetches(self):
+        with mock.patch.object(house_disclosures, "_session", self._session()), \
+                self._extract("FIRST"):
+            fetch_ptr_text(2026, "20033913")
+        session = self._session()
+        with mock.patch.object(house_disclosures, "_session", session), \
+                self._extract("SECOND"):
+            self.assertEqual(fetch_ptr_text(2026, "20033913", use_cache=False), "SECOND")
+        self.assertEqual(session.return_value.get.call_count, 1)
+
+    def test_a_doc_id_that_is_not_a_filename_is_never_written(self):
+        # The DocID comes off a network-fetched index; it is not our string.
+        with mock.patch.object(house_disclosures, "_session", self._session()), \
+                self._extract("TEXT"):
+            self.assertEqual(fetch_ptr_text(2026, "../../etc/passwd"), "TEXT")
+        self.assertEqual(list(Path(self.tmp.name).rglob("*")), [])
 
 
 if __name__ == "__main__":

@@ -208,8 +208,11 @@ const fmtSigned = v => (v >= 0 ? '+' : '-') + '$' + Math.round(Math.abs(v)).toLo
 const fmtPct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
 
 function renderHeader() {
+  const span = DATA.window_start && DATA.window_end
+    ? `trades ${DATA.window_start} to ${DATA.window_end}`
+    : 'disclosed trades';
   document.getElementById('subtitle').textContent =
-    `House members, ${DATA.year} · estimated returns from disclosed Periodic Transaction ` +
+    `House members, ${span} · estimated returns from disclosed Periodic Transaction ` +
     `Reports · generated ${String(DATA.generated_at).slice(0, 10)}`;
 
   const minInvested = fmtMoney(DATA.min_invested || 0);

@@ -2,6 +2,11 @@
 """Build a per-member stock trading performance leaderboard from House PTR filings.
 
 Methodology (share-based FIFO, mark-to-market):
+- Scope is a trailing window (PERFORMANCE_WINDOW_YEARS, 3 by default) measured on the
+  TRANSACTION date, read from every filing-year archive that can contain one. A single
+  archive is not a period: it holds whatever members happened to file that year, trades
+  from years earlier included, so ranking one archive ranks recent filers rather than
+  good pickers over a stated span.
 - Each disclosed transaction only gives a dollar RANGE, never an exact amount or share
   count. We take the midpoint of that range as the transaction's dollar value.
 - That dollar value is converted to ESTIMATED SHARES at the closing price on the
@@ -39,20 +44,23 @@ import pandas as pd
 import yfinance as yf
 
 from house_disclosures import (
+    PERFORMANCE_WINDOW_YEARS,
     PTR_FILING_TYPE,
     amount_midpoint,
-    fetch_index,
+    fetch_index_years,
     fetch_ptr_text,
     format_filer_name,
     member_key,
     parse_date,
     parse_transactions,
+    performance_index_years,
+    performance_window_start,
     resolve_ticker,
+    trade_transactions,
 )
 
 REPO_DIR = Path(__file__).resolve().parent
 OUTPUT_PATH = REPO_DIR / "leaderboard.json"
-YEAR = datetime.now(timezone.utc).year
 PRICE_BATCH_SIZE = 200
 FETCH_WORKERS = 8
 
@@ -67,36 +75,44 @@ BENCHMARK_TICKER = "SPY"
 # trade that falls off the front.
 PRICE_WINDOW_RUN_IN_DAYS = 7
 
-# A misparsed date should not drag a several-hundred-ticker download back a decade.
-# Anything older than this is treated as unpriceable rather than widening the window.
-MAX_PRICE_LOOKBACK_YEARS = 5
-
 # yfinance logs a multi-line block for every delisted/renamed ticker, which drowns the
 # run's own output. Delisted symbols are expected here and handled as "unpriced".
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
-def price_window_start(transactions: list[dict], year: int) -> str:
+def price_window_start(transactions: list[dict], window_start: datetime) -> str:
     """The earliest date the price series has to cover, as an ISO date string.
 
-    A PTR's transactions routinely predate the year it was filed in: the 45-day
-    reporting deadline alone puts December trades in the next year's index, and late
-    filers stretch that to months. Opening the window at January 1 of the filing year
-    therefore leaves every prior-year trade without a price on its own date -- 23% of
-    matched lots when this was measured.
+    The performance window's own start, unless every trade inside it is newer -- there
+    is no point downloading closes nothing prices against. Either way it is backed off
+    by PRICE_WINDOW_RUN_IN_DAYS, because PriceBook.on() rolls forward to the next close:
+    a trade dated on a weekend or a holiday needs the series to open strictly before it,
+    and without the run-in the oldest trade of all is the one that falls off the front.
 
-    Derived from the trades actually parsed, floored at MAX_PRICE_LOOKBACK_YEARS so a
-    misparsed date cannot widen the download without bound, and backed off by
-    PRICE_WINDOW_RUN_IN_DAYS so the oldest trade still has a close to roll forward to.
+    Trades reaching here are already filtered to the window on their transaction date,
+    so a misparsed ancient date cannot drag a several-hundred-ticker download back a
+    decade -- it is dropped before it gets here rather than widening the fetch.
     """
-    floor = datetime(year - MAX_PRICE_LOOKBACK_YEARS, 1, 1)
-    default = datetime(year, 1, 1)
     dates = [
         d for d in (parse_date(t.get("txn_date", "")) for t in transactions)
-        if d is not None and d >= floor
+        if d is not None
     ]
-    earliest = min(dates, default=default)
-    return (min(earliest, default) - timedelta(days=PRICE_WINDOW_RUN_IN_DAYS)).date().isoformat()
+    earliest = max(min(dates, default=window_start), window_start)
+    return (earliest - timedelta(days=PRICE_WINDOW_RUN_IN_DAYS)).date().isoformat()
+
+
+def in_performance_window(txn: dict, start: datetime, end: datetime) -> bool:
+    """True if a transaction happened inside the performance window.
+
+    Measured on the transaction date, never on the year the archive files it under. The
+    45-day deadline alone pushes December trades into the next year's archive and late
+    filers stretch that to months, so a 2026 archive currently reaches back to 2023 --
+    scoring its contents answers "who filed lately", not "who picked well since 2023".
+    An unparseable or future-dated row is outside the window by definition: there is no
+    date to price it on.
+    """
+    date = parse_date(txn.get("txn_date", ""))
+    return date is not None and start <= date <= end
 
 
 class PriceBook:
@@ -178,14 +194,16 @@ class PriceBook:
         return len(self._closes)
 
 
-def collect_transactions(ptr_rows: list[dict], verbose: bool) -> tuple[dict[tuple, list[dict]], int]:
+def collect_transactions(ptr_rows: list[dict], verbose: bool,
+                         use_cache: bool = True) -> tuple[dict[tuple, list[dict]], int]:
     """Fetch and parse every PTR, grouped by member. PDFs are fetched concurrently --
-    serially this is several hundred round-trips and dominates the runtime."""
+    serially this is a few thousand round-trips over a multi-year window and dominates
+    the runtime; fetch_ptr_text's on-disk text cache removes it entirely on a re-run."""
     by_member: dict[tuple, list[dict]] = defaultdict(list)
 
     def fetch(row):
         try:
-            text = fetch_ptr_text(row["Year"], row["DocID"])
+            text = fetch_ptr_text(row["Year"], row["DocID"], use_cache=use_cache)
             return row, parse_transactions(text) if text else []
         except Exception as exc:
             return row, exc
@@ -331,46 +349,78 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--year", type=int, default=YEAR, help=f"Filing year (default {YEAR})")
+    parser.add_argument("--window-years", type=int, default=PERFORMANCE_WINDOW_YEARS,
+                        help=f"Trailing performance window in years, measured on the "
+                             f"transaction date (default {PERFORMANCE_WINDOW_YEARS})")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only process the first N PTRs (for quick testing)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Re-fetch and re-extract every PDF instead of reading the "
+                             "cached text under cache/ptr_text")
     parser.add_argument("--min-invested", type=float, default=25_000,
                         help="Minimum estimated cost basis to be ranked (default 25000)")
     parser.add_argument("--min-trades", type=int, default=3,
                         help="Minimum priced trades to be ranked (default 3)")
     args = parser.parse_args()
+    if args.window_years < 1:
+        sys.exit("--window-years must be at least 1")
 
     now = datetime.now(timezone.utc)
-    rows = fetch_index(args.year)
+    window_start = performance_window_start(now, args.window_years)
+    window_end = now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    index_years = performance_index_years(now, args.window_years)
+
+    rows = fetch_index_years(index_years)
     ptr_rows = [r for r in rows if r.get("FilingType") == PTR_FILING_TYPE]
     if args.limit:
         ptr_rows = ptr_rows[:args.limit]
-    print(f"{len(ptr_rows)} PTR(s) to process for {args.year}.", file=sys.stderr)
+    print(f"{len(ptr_rows)} PTR(s) to process from the "
+          f"{', '.join(str(y) for y in index_years)} archive(s), for trades between "
+          f"{window_start.date()} and {window_end.date()}.", file=sys.stderr)
 
-    meta = {member_key(r): {"name": format_filer_name(r), "state_dist": r.get("StateDst", "?")}
-            for r in ptr_rows}
-    by_member, parsed_lines = collect_transactions(ptr_rows, args.verbose)
+    # The newest archive wins a filer's display fields: a member who changed their name
+    # or acquired a title mid-window should read as they file today. Index rows arrive
+    # newest year first, so the first one seen wins. Identity itself is member_key(),
+    # which normalizes across those spellings -- see house_disclosures.member_key.
+    meta: dict[tuple, dict] = {}
+    for r in ptr_rows:
+        meta.setdefault(member_key(r), {
+            "name": format_filer_name(r),
+            "first": r.get("First", "").strip(),
+            "last": r.get("Last", "").strip(),
+            "state_dist": r.get("StateDst", "?"),
+        })
+    by_member, parsed_lines = collect_transactions(ptr_rows, args.verbose,
+                                                   use_cache=not args.no_cache)
 
-    # Resolve tickers once across all members so the name-lookup cache is shared.
+    # Resolve tickers once across all members so the name-lookup cache is shared. Only
+    # in-window buys and sells get here: the archives are fetched by filing year and
+    # reach further back than the window they are read for, and a row that is neither a
+    # purchase nor a sale (an Exchange) has no direction to score.
     tradeable: dict[tuple, list[dict]] = defaultdict(list)
     tickers: set[str] = set()
+    non_trade_lines = out_of_window_lines = 0
     for key, txns in by_member.items():
-        for t in txns:
-            if t["type"] not in ("Purchase", "Sale"):
+        trades = trade_transactions(txns)
+        non_trade_lines += len(txns) - len(trades)
+        for t in trades:
+            if not in_performance_window(t, window_start, window_end):
+                out_of_window_lines += 1
                 continue
             t["ticker"] = resolve_ticker(t)
             if t["ticker"]:
                 tickers.add(t["ticker"])
                 tradeable[key].append(t)
-    print(f"{sum(len(v) for v in tradeable.values())} Purchase/Sale line(s) across "
-          f"{len(tickers)} ticker(s).", file=sys.stderr)
+    print(f"{sum(len(v) for v in tradeable.values())} in-window Purchase/Sale line(s) "
+          f"across {len(tickers)} ticker(s); {out_of_window_lines} trade line(s) fell "
+          f"outside the window and {non_trade_lines} were not buys or sells.",
+          file=sys.stderr)
 
-    # The window opens at the oldest trade we actually hold, not at January 1: a filing
-    # indexed this year routinely discloses last year's trades, and a price the window
-    # does not cover is now reported as unpriced rather than silently answered with a
-    # later close.
+    # The price series opens at the window's start, or later if every trade in it is --
+    # a price the series does not cover is reported as unpriced rather than silently
+    # answered with a later close.
     all_txns = [t for txns in tradeable.values() for t in txns]
-    start = price_window_start(all_txns, args.year)
+    start = price_window_start(all_txns, window_start)
     prices = PriceBook(tickers | {BENCHMARK_TICKER}, start=start,
                        end=(now.date().isoformat()))
     priced = sum(1 for t in tickers if t in prices)
@@ -383,7 +433,11 @@ def main() -> None:
     for key, txns in tradeable.items():
         entry = {
             "member": meta[key]["name"],
-            "last": key[0], "first": key[1],
+            # Identity the monitors match index rows against; the name fields beside it
+            # are for display and are whatever the newest archive spells them.
+            "member_key": list(key),
+            "first": meta[key]["first"],
+            "last": meta[key]["last"],
             "state_dist": meta[key]["state_dist"],
         }
         entry.update(score_member(txns, prices))
@@ -406,24 +460,32 @@ def main() -> None:
 
     OUTPUT_PATH.write_text(json.dumps({
         "generated_at": now.isoformat(),
-        "year": args.year,
+        "window_years": args.window_years,
+        "window_start": window_start.date().isoformat(),
+        "window_end": window_end.date().isoformat(),
+        "index_years": index_years,
         "min_invested": args.min_invested,
         "min_trades": args.min_trades,
         "totals": {
             "ptr_count": len(ptr_rows),
             "transaction_lines": parsed_lines,
             "tradeable_lines": sum(len(v) for v in tradeable.values()),
+            "out_of_window_lines": out_of_window_lines,
+            "non_trade_lines": non_trade_lines,
             "tickers": len(tickers),
             "tickers_priced": len(prices),
         },
         "benchmark_ticker": BENCHMARK_TICKER,
         "price_window_start": start,
         "methodology": (
-            "Estimated shares = disclosed range midpoint / close on the transaction date; "
-            "buys and sells FIFO-matched in share space for realized gains; unsold shares "
-            "marked to the latest close. Unmatched sales (positions opened before the "
-            "window) and non-equity assets are excluded from gain estimates but counted "
-            "as trades. Members below min_invested/min_trades are unranked. "
+            f"Scope is every Purchase/Sale disclosed with a transaction date in the "
+            f"{args.window_years}-year window ending {window_end.date().isoformat()}, "
+            "read from each filing-year archive that can contain one. Estimated shares = "
+            "disclosed range midpoint / close on the transaction date; buys and sells "
+            "FIFO-matched in share space for realized gains; unsold shares marked to the "
+            "latest close. Unmatched sales (positions opened before the window) and "
+            "non-equity assets are excluded from gain estimates but counted as trades. "
+            "Members below min_invested/min_trades are unranked. "
             f"alpha_pct_estimate is the return less what {BENCHMARK_TICKER} returned over "
             "the same holding windows, dollar-weighted the same way."
         ),

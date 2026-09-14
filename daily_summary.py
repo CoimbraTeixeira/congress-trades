@@ -33,19 +33,24 @@ from house_disclosures import (
     index_years,
     member_key,
     parse_transactions,
+    trade_transactions,
 )
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
+    PDF_GIVE_UP,
     STATE_DIR,
     add_all_assets_arg,
+    add_pending_grace_arg,
     baseline_docids,
     compact_dollars,
     escape_markdown,
-    load_watch_state,
+    load_alert_state,
     load_webhook_url,
     log,
+    pdf_wait_action,
     plural,
-    save_watch_state,
+    run_lock,
+    save_alert_state,
     send_discord_message,
     shorten,
     split_message,
@@ -271,11 +276,19 @@ def main() -> None:
     parser.add_argument("--post-empty", action="store_true",
                         help="Post the digest even when no new filings landed")
     add_all_assets_arg(parser)
+    add_pending_grace_arg(parser)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the digest without posting or recording state")
     args = parser.parse_args()
 
+    # The digest is daily, but it shares the seen-set discipline of the hourly monitors:
+    # a manual run alongside the scheduled one would otherwise post twice.
+    with run_lock("daily_summary"):
+        run(args)
+
+
+def run(args) -> None:
     if not LEADERBOARD_PATH.exists():
         sys.exit(f"Missing {LEADERBOARD_PATH} -- run build_leaderboard.py first")
     leaderboard = json.loads(LEADERBOARD_PATH.read_text())
@@ -283,8 +296,13 @@ def main() -> None:
     top_members = select_members(leaderboard, args.top, args.rank_by)
     if not top_members:
         sys.exit("No members to summarise -- regenerate leaderboard.json.")
+    if any("member_key" not in m for m in top_members):
+        sys.exit(f"{LEADERBOARD_PATH} predates normalized member identity -- rerun "
+                 f"build_leaderboard.py.")
+    # Matched on the leaderboard's normalized (surname, district) key, not the printed
+    # name: the index spells the same filer differently from one archive to the next.
     covered_by_key = {
-        (m["last"], m["first"], m["state_dist"]): dict(m, rank=rank)
+        tuple(m["member_key"]): dict(m, rank=rank)
         for rank, m in enumerate(top_members, start=1)
     }
 
@@ -302,24 +320,26 @@ def main() -> None:
               f"{len(top_members)} --")
 
     first_run = not STATE_PATH.exists()
-    seen, previously_covered = load_watch_state(STATE_PATH)
+    state = load_alert_state(STATE_PATH)
     covered_members = set(covered_by_key)
 
     # Same rule as watchlist_monitor: a member entering the top-N is baselined so the
     # digest doesn't replay their year, but their last few days still count.
-    newly_covered = covered_members - previously_covered
+    newly_covered = covered_members - state.members
     if newly_covered:
         stale = baseline_docids(covered_rows, newly_covered, now, args.baseline_window,
                                 apply_window=not first_run)
-        seen |= stale
+        state.seen |= stale
         log(f"Baselined {len(stale)} existing PTR(s) for {len(newly_covered)} member(s) "
             f"new to the top {len(top_members)}.")
-    if covered_members != previously_covered and not args.dry_run:
-        save_watch_state(STATE_PATH, seen, covered_members)
+    if covered_members != state.members:
+        state.members = covered_members
+        if not args.dry_run:
+            save_alert_state(STATE_PATH, state)
     if first_run:
         return
 
-    new_rows = [r for r in covered_rows if r["DocID"] not in seen]
+    new_rows = [r for r in covered_rows if r["DocID"] not in state.seen]
     if not new_rows and not args.post_empty:
         log(f"No new filings from the top {len(top_members)}; nothing to summarise.")
         return
@@ -331,9 +351,15 @@ def main() -> None:
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {row['DocID']}: {exc}", file=sys.stderr)
             transactions = []
-        reported = transactions if args.all_assets else equity_transactions(transactions)
+        # Buys and sells only, and stocks only unless --all-assets: an Exchange is a
+        # share-class swap or a merger conversion, so it has no direction to report and
+        # a filing holding nothing else drops out here rather than reaching the digest
+        # as a member line with neither a BOUGHT nor a SOLD row under it.
+        reported = trade_transactions(
+            transactions if args.all_assets else equity_transactions(transactions))
         return {
             "member": covered_by_key[member_key(row)],
+            "doc_id": row["DocID"],
             "pdf_link": PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
             # Whether the PDF read at all, kept separate from whether it held any stock
             # trades -- the digest prints "could not be read" off the first, and dropping
@@ -344,16 +370,33 @@ def main() -> None:
         }
 
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-        entries = list(pool.map(load, new_rows))
+        all_entries = list(pool.map(load, new_rows))
 
-    entries = [e for e in entries if e["txn_count"] or e["unreadable"]]
+    entries = [e for e in all_entries if e["txn_count"] or e["unreadable"]]
+    # A filing whose PDF has not published yet is held over instead of being reported as
+    # unreadable: the Clerk indexes a row before the document is reachable, and tomorrow's
+    # digest will have the real contents. Only after the grace period does it go in as
+    # unreadable, so a genuinely broken filing is still reported once.
+    deferred = set()
+    for row, entry in zip(new_rows, all_entries):
+        if not entry["unreadable"]:
+            state.pending.pop(row["DocID"], None)
+            continue
+        if pdf_wait_action(row["DocID"], state.pending, now, args.pending_grace) != PDF_GIVE_UP:
+            state.pending.setdefault(row["DocID"], now.isoformat())
+            deferred.add(row["DocID"])
+    if deferred:
+        log(f"Holding {len(deferred)} filing(s) whose PDF has not published yet for a "
+            f"later digest.")
+    entries = [e for e in entries if e["doc_id"] not in deferred]
+    handled = [r["DocID"] for r in new_rows if r["DocID"] not in deferred]
     if not entries and not args.post_empty:
         log(f"{plural(len(new_rows), 'new filing')} from the top {len(top_members)}, "
-            f"none with stock transactions; nothing to summarise.")
+            f"none with reportable stock transactions; nothing to summarise.")
         if not args.dry_run:
             # Still handled -- leaving them unseen would re-fetch every PDF tomorrow.
-            seen |= {r["DocID"] for r in new_rows}
-            save_watch_state(STATE_PATH, seen, covered_members)
+            state.seen |= set(handled)
+            save_alert_state(STATE_PATH, state)
         return
 
     scope_label = {"alpha": "est. alpha", "return": "est. return"}.get(
@@ -380,8 +423,8 @@ def main() -> None:
         # Leave every DocID unseen so the next run retries rather than losing the day.
         sys.exit(f"Failed to post the digest: {exc}")
 
-    seen |= {r["DocID"] for r in new_rows}
-    save_watch_state(STATE_PATH, seen, covered_members)
+    state.seen |= set(handled)
+    save_alert_state(STATE_PATH, state)
     log(f"Posted a digest covering {plural(len(entries), 'new filing')}{tail} from the "
         f"top {len(top_members)}.")
 

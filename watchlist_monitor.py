@@ -25,6 +25,9 @@ from house_disclosures import (
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
     LATE_LEGEND,
+    PDF_ANNOUNCE,
+    PDF_GIVE_UP,
+    PDF_WAIT,
     STATE_DIR,
     add_common_args,
     any_late,
@@ -32,11 +35,13 @@ from monitor_common import (
     display_name,
     escape_markdown,
     format_transaction,
-    load_watch_state,
+    load_alert_state,
     load_webhook_url,
     log,
+    pdf_wait_action,
     plural,
-    save_watch_state,
+    run_lock,
+    save_alert_state,
     send_discord_message,
 )
 from search_common import THEME_SIMILARITY, ThemeIndex
@@ -112,7 +117,8 @@ def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int
     ]
     if not buys:
         # Silence here would read as "this filing had no purchases", which is the one
-        # thing it does not mean.
+        # thing it does not mean. Only sent once the grace period for the PDF to publish
+        # has run out -- before that the filing is announced instead, and the buys follow.
         lines += [
             f"Filed {filing_date} · transactions could not be read from the PDF, so "
             f"this may or may not contain a buy",
@@ -135,6 +141,23 @@ def build_message(member: dict, row: dict, buys: list[dict], watchlist_size: int
     return "\n".join(lines)
 
 
+def build_landed_message(member: dict, row: dict, watchlist_size: int) -> str:
+    """A watched member's filing is in the index but its PDF is not published yet.
+
+    Worth its own alert here for the same reason as the general monitor, and more so:
+    the point of this monitor is speed on a watched member's buys, and the index row is
+    the earliest evidence that exists.
+    """
+    return "\n".join([
+        f"🚨 **{escape_markdown(member['member'])}** ({member['state_dist']}) — "
+        f"watchlist filing landed",
+        f"#{member['rank']} of {watchlist_size} on the watchlist",
+        f"Filed {row.get('FilingDate', '?')} · contents not published yet; any buys "
+        f"will follow when the PDF appears",
+        PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
+    ])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
@@ -144,12 +167,24 @@ def main() -> None:
              f"N days (default {DEFAULT_BASELINE_WINDOW_DAYS}); 0 keeps only same-day ones")
     args = parser.parse_args()
 
+    # Hourly polling can overlap a slow run, and both would post the same buy alert.
+    with run_lock("watchlist_monitor"):
+        run(args)
+
+
+def run(args) -> None:
     if not WATCHLIST_PATH.exists():
         sys.exit(f"Missing {WATCHLIST_PATH} -- run build_watchlist.py first")
     watchlist = json.loads(WATCHLIST_PATH.read_text())
     benchmark = watchlist.get("benchmark_ticker") or "the benchmark"
+    if any("member_key" not in m for m in watchlist["members"]):
+        sys.exit(f"{WATCHLIST_PATH} predates normalized member identity -- rerun "
+                 f"build_leaderboard.py and build_watchlist.py.")
+    # The key is the leaderboard's own normalized (surname, district): the index spells
+    # the same filer's name differently from archive to archive, so matching on the
+    # printed name silently drops that member's filings.
     watched_by_key = {
-        (m["last"], m["first"], m["state_dist"]): dict(m, rank=rank, benchmark=benchmark)
+        tuple(m["member_key"]): dict(m, rank=rank, benchmark=benchmark)
         for rank, m in enumerate(watchlist["members"], start=1)
     }
 
@@ -166,8 +201,12 @@ def main() -> None:
         print(f"-- {len(rows)} filings, {len(watched_rows)} PTRs from watchlist members --")
 
     first_run = not STATE_PATH.exists()
-    seen, previously_watched = load_watch_state(STATE_PATH)
+    state = load_alert_state(STATE_PATH)
     watched_members = set(watched_by_key)
+
+    def persist() -> None:
+        if not args.dry_run:
+            save_alert_state(STATE_PATH, state)
 
     # Baseline any member who wasn't on the watchlist last run -- on the very first run
     # that's everyone, and later it's whoever the latest build_watchlist.py promoted.
@@ -178,32 +217,36 @@ def main() -> None:
     # State holds last run's membership rather than every member ever seen, so someone
     # who drops off and is promoted again months later is re-baselined instead of
     # replaying their whole absence. build_watchlist.py runs daily, so that happens.
-    newly_watched = watched_members - previously_watched
+    newly_watched = watched_members - state.members
     if newly_watched:
         stale = baseline_docids(watched_rows, newly_watched, now, args.baseline_window,
                                 apply_window=not first_run)
-        seen |= stale
+        state.seen |= stale
         label = "watchlist member(s)" if first_run else "newly promoted member(s)"
         log(f"Baselined {len(stale)} existing PTR(s) for {len(newly_watched)} "
             f"{label}, no alerts sent for those.")
-    if watched_members != previously_watched and not args.dry_run:
-        save_watch_state(STATE_PATH, seen, watched_members)
+    if watched_members != state.members:
+        state.members = watched_members
+        persist()
     if first_run:
         return
 
-    new_rows = [r for r in watched_rows if r["DocID"] not in seen]
+    # A filing announced ahead of its PDF stays out of `seen`, so it returns here every
+    # run until the buys can be read or the grace period expires.
+    new_rows = [r for r in watched_rows if r["DocID"] not in state.seen]
     backlog = max(0, len(new_rows) - args.max_alerts)
     if backlog:
         log(f"{len(new_rows)} new watchlist PTR(s) exceeds --max-alerts={args.max_alerts}; "
             f"handling {args.max_alerts} now, leaving {backlog} for the next run.")
         new_rows = new_rows[: args.max_alerts]
     if args.verbose:
-        print(f"-- {len(new_rows)} new watchlist PTR(s) --")
+        print(f"-- {len(new_rows)} new watchlist PTR(s), {len(state.pending)} awaiting "
+              f"a PDF --")
 
     # Built once per run, not per alert: it reads the whole ticker collection, and the
     # vectors it needs are already in the store, so no embedding model is loaded here.
     index = ThemeIndex()
-    sent = 0
+    sent = announced = waiting = 0
     for row in new_rows:
         doc_id = row["DocID"]
         member = watched_by_key[member_key(row)]
@@ -212,36 +255,69 @@ def main() -> None:
             transactions = parse_transactions(pdf_text) if pdf_text else []
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
-            transactions = None
+            transactions = []
 
-        purchases = [t for t in transactions if t["type"] == "Purchase"] if transactions else []
+        # A filing we couldn't read is not a filing without purchases, and staying silent
+        # on it is indistinguishable from "nothing happened". But an unpublished PDF is
+        # not an unreadable one either: announce the filing, then alert the buys when the
+        # contents appear, and only call it unreadable once the grace period is spent.
+        if not transactions:
+            action = pdf_wait_action(doc_id, state.pending, now, args.pending_grace)
+            if action == PDF_WAIT:
+                waiting += 1
+                if args.verbose:
+                    print(f"{doc_id}: PDF still unreadable, announced "
+                          f"{state.pending[doc_id]} — waiting")
+                continue
+            message = (build_landed_message(member, row, len(watched_by_key))
+                       if action == PDF_ANNOUNCE
+                       else build_message(member, row, [], len(watched_by_key), index))
+            if not deliver(message, doc_id, webhook_url, args):
+                continue
+            if action == PDF_ANNOUNCE:
+                announced += 1
+                state.pending[doc_id] = now.isoformat()
+            elif action == PDF_GIVE_UP:
+                sent += 1
+                state.pending.pop(doc_id, None)
+                state.seen.add(doc_id)
+            persist()
+            continue
+
+        state.pending.pop(doc_id, None)
+        purchases = [t for t in transactions if t["type"] == "Purchase"]
         # A watchlist member buying a Treasury note is not the signal this monitor exists
         # for -- they are ranked on equity returns, so a bond purchase says nothing about
         # why they are watched.
         buys = purchases if args.all_assets else equity_transactions(purchases)
-        # A filing we couldn't read is not a filing without purchases. Staying silent on
-        # it is indistinguishable from "nothing happened", so send it with a link instead
-        # and let the reader open the PDF. (`transactions` rather than `buys` is what
-        # separates the two: a bond-only filing was read perfectly well.)
-        if buys or not transactions:
+        if buys:
             message = build_message(member, row, buys, len(watched_by_key), index)
-            if args.verbose or args.dry_run:
-                print(message)
-                print("---")
-            if not args.dry_run:
-                try:
-                    send_discord_message(webhook_url, message)
-                except requests.RequestException as exc:
-                    print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
-                    continue  # don't mark as seen if we couldn't alert
+            if not deliver(message, doc_id, webhook_url, args):
+                continue
             sent += 1
-        if not args.dry_run:
-            seen.add(doc_id)
-            save_watch_state(STATE_PATH, seen, watched_members)
+        state.seen.add(doc_id)
+        persist()
 
     verb = "Would send" if args.dry_run else "Sent"
     log(f"{verb} {sent} buy alert(s) out of {len(new_rows)} new watchlist filing(s)."
+        + (f" {announced} filing(s) announced ahead of their PDF." if announced else "")
+        + (f" {waiting} still awaiting a PDF." if waiting else "")
         + (f" {backlog} deferred." if backlog else ""))
+
+
+def deliver(message: str, doc_id: str, webhook_url: str | None, args) -> bool:
+    """Post one alert. False means the caller must not record the filing as handled."""
+    if args.verbose or args.dry_run:
+        print(message)
+        print("---")
+    if args.dry_run:
+        return True
+    try:
+        send_discord_message(webhook_url, message)
+    except requests.RequestException as exc:
+        print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 if __name__ == "__main__":

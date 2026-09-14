@@ -38,10 +38,10 @@ the `core.hooksPath` line above is required once per clone. Bypass a false posit
 
 | Script | What it does |
 |---|---|
-| `house_disclosures.py` | Shared library: fetch the index, pull a PTR PDF, parse its transaction table |
+| `house_disclosures.py` | Shared library: fetch the index, pull a PTR PDF (cached as text), parse its transaction table, key a filer's identity |
 | `monitor_common.py` | Shared monitor plumbing: webhook config, seen-DocID state, Discord delivery |
 | `congress_monitor.py` | Alerts on **every** new PTR filing containing a stock trade |
-| `build_leaderboard.py` | Estimates per-member returns and alpha vs SPY → `leaderboard.json` |
+| `build_leaderboard.py` | Estimates per-member returns and alpha vs SPY over the last 3 years → `leaderboard.json` |
 | `build_watchlist.py` | Snapshots the top-N ranked members → `watchlist.json` |
 | `watchlist_monitor.py` | Alerts only when a watchlist member files a **purchase**, with a theme note when the index is built |
 | `daily_summary.py` | One consolidated daily digest of the top-N's trades, buys and sells, incl. themed roll-ups |
@@ -54,7 +54,7 @@ Typical order:
 
 ```bash
 python3 congress_monitor.py --dry-run     # first run seeds a baseline, no alerts
-python3 build_leaderboard.py              # ~1-2 min: fetches every PTR + prices
+python3 build_leaderboard.py              # ~70s cold, ~40s warm: 3 years of PTRs + prices
 python3 build_watchlist.py
 python3 build_dashboard.py
 python3 build_search_index.py             # optional: ~20s, builds the semantic search index
@@ -113,6 +113,50 @@ Options still carry their `[option]` tag, since "bought Nvidia" and "bought Nvid
 are different events. Non-equities remain counted as trades in the leaderboard's volume
 figures and excluded from its returns, per *Reading the numbers* below — the filter is
 about what gets pushed to you, not about what the numbers are built from.
+
+## The three-year window
+
+The leaderboard scores **every buy and sell disclosed with a transaction date in the last
+three years** (`--window-years`, default `PERFORMANCE_WINDOW_YEARS`), and `build_watchlist.py`
+and `daily_summary.py` inherit that ranking — so "high performer" means a three-year
+record, not whoever looked good in the archive that happened to be open.
+
+One filing-year archive is not a period. It holds whatever members filed that year,
+including trades from years earlier: the 2026 archive alone reaches back to October 2023
+through late filers, while dropping every 2024 trade nobody re-disclosed. Ranking it
+ranks recent filers.
+
+So the window is measured on the **transaction date**, and the archives are read by
+**filing year**: a filing is indexed in the year it was filed, never earlier than the
+year the trade happened, so covering three years of trades means reading four archives
+(2023–2026 today) and discarding the rows that fall outside. `leaderboard.json` states
+the window it used (`window_start`, `window_end`, `index_years`) and counts what it threw
+away (`totals.out_of_window_lines`, `totals.non_trade_lines`).
+
+**Only `Purchase` and `Sale` rows are scored.** An `Exchange` is a share-class swap or a
+merger conversion — no direction, no price to attribute to a pick — and the digest now
+drops those too, so a filing containing nothing else no longer shows up as a member line
+with neither a BOUGHT nor a SOLD row under it.
+
+Reading four archives also exposed something one archive hid: **the index does not spell
+a filer's name the same way twice.** The same representative files as
+`Greene / Marjorie Taylor` and `Greene / Marjorie Taylor Mrs`, as `Franklin / C. Scott`
+and `Franklin / Scott Scott`, as `Dunn, MD, FACS / Neal Patrick` and
+`Dunn / Neal Patrick MD, Facs`. Keyed on the raw fields, Greene scored **twice** — 135
+trades at +37% alpha and 268 at +27%, two of the top five slots for one person on half a
+record each. Identity is therefore the normalized **(surname, district)** pair
+(`member_key`, carried in `leaderboard.json` and `watchlist.json`, matched by both
+monitors): titles and post-nominals are stripped, the first name is left out entirely
+because `C. Scott` and `Scott Scott` cannot be reconciled, and the district is what keeps
+two same-surname members (Tim Moore NC14, Blake Moore UT01) apart. Merged, Greene is one
+member with 403 priced trades.
+
+Four archives is ~1,800 PTRs per rebuild rather than ~390 (8 MB of text), so extracted
+PDF text is cached under `cache/ptr_text/<year>/<DocID>.txt` (gitignored). A filing never
+changes, so a warm rebuild re-downloads nothing but prices. Only a successful, non-empty
+extraction is cached: caching a 404 — the Clerk publishes index rows slightly ahead of
+some PDFs — or an unreadable PDF would turn a transient failure into a permanent one.
+`--no-cache` forces the re-fetch.
 
 ## Semantic search
 
@@ -204,13 +248,13 @@ python3 daily_summary.py --top 50 --rank-by volume # rank by dollars traded inst
 python3 daily_summary.py --post-empty              # post even on a quiet day
 ```
 
-**`--top 50` will usually cover fewer than 50 members.** Ranking by alpha or return
-needs a computable return, and most members are sell-only in a given year — as of the
-last build, 79 members have a priced trade and 26 clear the leaderboard's
-`--min-invested`/`--min-trades` thresholds. The digest states the shortfall in its own
-header rather than quietly reporting on a smaller field. For a true 50, either use
-`--rank-by volume` (ranks by dollars traded, which every filer has) or lower the
-leaderboard thresholds.
+**`--top 50` will usually cover fewer than 50 members.** Ranking by alpha or return needs
+a computable return, and many members are sell-only across the whole window — as of the
+last build, 125 members disclosed a tickered buy or sell in the three years, 79 have a
+computable return and 59 clear the leaderboard's `--min-invested`/`--min-trades`
+thresholds. The digest states the shortfall in its own header rather than quietly
+reporting on a smaller field. For a true 50, either use `--rank-by volume` (ranks by
+dollars traded, which every filer has) or lower the leaderboard thresholds.
 
 Scope is "filings not yet summarised", not "filings dated today": the Clerk's archive
 publishes on its own schedule and a filing routinely appears days after its filing
@@ -218,8 +262,9 @@ date, so a fixed 24-hour window would drop it. A quiet day posts nothing unless
 `--post-empty` is set.
 
 Both monitors take `--verbose`, `--dry-run` (print, don't post or record state),
-`--all-assets` (see *Stocks only* above) and `--max-alerts N` (default 25; the oldest N
-are handled and the excess is left for the next run rather than dropped).
+`--all-assets` (see *Stocks only* above), `--max-alerts N` (default 25; the oldest N
+are handled and the excess is left for the next run rather than dropped) and
+`--pending-grace H` (default 24 — see *Polling and the publish gap* below).
 `watchlist_monitor.py` also takes `--baseline-window N` (default 7) — see below.
 
 The first run of a monitor records every existing filing as "seen" and sends
@@ -234,7 +279,7 @@ moment the calendar rolls over.
 
 ## Why an alert might not fire
 
-Alert volume is dominated by the watchlist filter — ten members out of ~60 who file,
+Alert volume is dominated by the watchlist filter — ten members out of the ~125 who file,
 buys only — so a few a week is the expected rate, not a fault. The things that were
 silently costing alerts, and what they do now:
 
@@ -245,25 +290,64 @@ silently costing alerts, and what they do now:
   A third of filings are in this category, so this is now the most common reason.
   `--all-assets` turns it off.
 - A PTR whose **PDF won't fetch or parse** used to yield zero purchases, which is
-  indistinguishable from a filing with no purchases in it. It now sends an alert saying
-  so, with the link, rather than nothing.
+  indistinguishable from a filing with no purchases in it. It now announces the filing
+  and alerts the contents when the PDF publishes — see below.
 - `--max-alerts` truncation now keeps the **oldest** filings; the archive's row order
   isn't chronological, so it previously kept an arbitrary slice.
+
+## Polling and the publish gap
+
+The monitors run **hourly**, the digest and the rebuild stay daily. Disclosure itself is
+statutory, not technical: measured across the 3,066 transactions in the 2026 archive, the
+median trade reaches the public 25 days after it happens (p10 8, p75 35, p90 46; 89.8%
+inside the 45-day deadline, 8.2% within a week). Nothing makes that faster — polling
+frequency only decides how much of the *remaining* lag is ours. Daily polling added up to
+24 hours to every alert; hourly cuts that to one, and the index ZIP plus the extracted-text
+cache make a quiet run cheap.
+
+Two things had to change for hourly polling to be safe:
+
+- **A run can outlive its slot.** A slow Clerk, a backlog of PDFs or a Discord 429 backoff
+  can push a run past the hour, and two overlapping runs read the same seen-set and post
+  the same alert twice. Each monitor now takes an exclusive `flock` on
+  `state/<monitor>.lock` and a second run exits 0 — a skipped poll is not an error, and
+  cron mailing about one every hour would be.
+- **The index row publishes before the PDF.** The Clerk lists a filing in the archive
+  before the document is reachable; a daily poll almost never saw that window, an hourly
+  one hits it routinely. Alerting "transactions could not be read" and marking the filing
+  handled would spend its only notification on the gap. So the first sighting sends an
+  **index-row-first alert** — *"new trade disclosure filed · contents not published yet"* —
+  and the filing stays unseen, retried every run, until the PDF parses and the
+  transactions go out as a second alert. A PDF still unreadable after `--pending-grace`
+  hours (default 24) is genuinely broken and gets the "could not be read" alert, once.
+  `--pending-grace 0` restores the old single-alert behaviour.
+
+The waiting set lives in the state file beside the seen-set (`{"seen": [...],
+"pending": {"<DocID>": "<first sighted>"}}`), which also reads the old bare-list and
+pending-less formats, so upgrading does not replay a back catalogue. `daily_summary.py`
+holds an unpublished filing over to the next digest for the same reason.
 
 ## Schedule
 
 ```cron
+ 0 * * * * python3 congress_monitor.py    >> monitor.log 2>&1
+20 * * * * python3 watchlist_monitor.py   >> watchlist_monitor.log 2>&1
 30 12 * * * ( python3 build_leaderboard.py && python3 build_watchlist.py && python3 build_search_index.py ) >> rebuild.log 2>&1
- 0 13 * * * python3 congress_monitor.py    >> monitor.log 2>&1
-30 13 * * * python3 watchlist_monitor.py   >> watchlist_monitor.log 2>&1
  0 14 * * * python3 daily_summary.py       >> summary.log 2>&1
 ```
 
-The rebuild runs first so the watchlist and the digest's top-N reflect the current
-leaderboard rather than whoever was ranked the day the files were last written by hand.
-Because that rotates the membership daily, both the watchlist monitor and the digest
-record *last run's* membership and re-baseline anyone who leaves and comes back — a
-growing all-time set would replay a returning member's entire absence in one burst.
+The two per-filing monitors poll hourly and are offset 20 minutes apart so they don't
+fetch the index simultaneously; each holds its own lock, so an overrun is skipped rather
+than doubled. The digest stays once a day, and the rebuild runs before it so the
+watchlist and the digest's top-N reflect the current leaderboard rather than whoever was
+ranked the day the files were last written by hand. Because that rotates the membership
+daily, both the watchlist monitor and the digest record *last run's* membership and
+re-baseline anyone who leaves and comes back — a growing all-time set would replay a
+returning member's entire absence in one burst.
+
+A daily rebuild over a three-year window only stays cheap because the extracted PDF text
+is cached (see *The three-year window*): the first run pulls ~1,800 PDFs, and after that
+each run fetches only the filings that are new plus the price series.
 
 `build_search_index.py` is last in the chain because it reads `leaderboard.json`. It is
 chained rather than scheduled separately so the index can never describe a leaderboard
@@ -285,14 +369,25 @@ a page break.
 
 `tests/test_monitors.py` covers the other half — the ways a real filing can end up
 silently not alerted (wrong index year, baselined on promotion, read as "no purchases"
-when it was really unreadable).
+when it was really unreadable) — plus what hourly polling added: the publish-gap state
+machine (announce once, wait silently, give up after the grace period, and resolve a
+corrupt or naive timestamp rather than retrying forever), the state file's two legacy
+formats, and the run lock releasing on both a clean exit and a crash.
 
 `tests/test_leaderboard.py` covers the scoring engine: the FIFO matcher, the price
-lookup's boundaries, and the benchmark comparison. The parser had tests from the start
-and the scorer had none, which is how a trade dated before the fetched price window
-came to be priced at the first close of the filing year — silently wrong rather than
-merely missing, for 23% of matched lots. Both halves of that fix have a regression test
-here.
+lookup's boundaries, the benchmark comparison, and the three-year window itself — that a
+prior-year trade disclosed late is still scored, and that a trade older than the window
+(or ancient through a misparse, or future-dated) is dropped rather than priced. The
+parser had tests from the start and the scorer had none, which is how a trade dated
+before the fetched price window came to be priced at the first close of the filing year
+— silently wrong rather than merely missing, for 23% of matched lots. Both halves of
+that fix have a regression test here.
+
+`tests/test_house_disclosures.py` also pins the two things the multi-year window added:
+filer identity — the real Greene/Franklin/Dunn spelling variants collapse to one member
+while two same-surname members in different districts stay apart — and the extracted-text
+cache, where a cached filing is not re-fetched and a 404 or an unreadable PDF is never
+cached, so a transient failure cannot become permanent.
 
 ## Reading the numbers
 
@@ -312,15 +407,15 @@ amount or a share count.
   is underperformance, and ranking on the raw figure promotes whoever held the most
   beta rather than whoever picked well. Cisneros is the standing example — +7.5%
   return, and SPY did +7.8% over the same windows.
-- The price window opens at the **earliest transaction actually disclosed**, not at
-  January 1. Filings routinely report prior-year trades (the 45-day deadline alone
-  guarantees it, and late filers stretch it to months), and a price outside the window
-  is reported as `unpriced_trades` rather than answered with the first close we happen
-  to hold. Anything older than five years is treated as unpriceable rather than
-  widening the fetch without bound.
+- Scope is the trailing **three years of transaction dates**, read across every archive
+  that can hold one — see *The three-year window* above. Rows outside it are counted in
+  `totals.out_of_window_lines` and scored nowhere.
+- The price series opens at the **window's start**, or at the oldest trade inside it when
+  every trade is newer, never at January 1. A price the series does not cover is reported
+  as `unpriced_trades` rather than answered with the first close we happen to hold.
 - Sales exceeding matched buys were opened before the window, have unknown cost
-  basis, and are excluded. Many members are sell-only in a given year and so have
-  no computable return at all.
+  basis, and are excluded. Many members are sell-only across the whole window and so
+  have no computable return at all.
 - Unsold shares are marked to the latest close — hypothetical, not cashed out.
   All prices come from the same split/dividend-adjusted series, so history and
   "today" are comparable.
@@ -329,8 +424,9 @@ amount or a share count.
   the filing's asset-type code, because a name lookup will cheerfully match
   "US Treasury Note" to some unrelated equity.
 - Members are **ranked** only above `--min-invested` / `--min-trades` thresholds;
-  otherwise a single lucky $15k trade tops the board. Unranked members still
-  appear in `leaderboard.json` and greyed in the dashboard table.
+  otherwise a single lucky $15k trade tops the board. Both count across the whole
+  window, so three years of trading clears them more easily than one year did.
+  Unranked members still appear in `leaderboard.json` and greyed in the dashboard table.
 - `build_watchlist.py` and `daily_summary.py` both rank on alpha by default and take
   `--rank-by return` to go back to the raw figure. A member whose lots the benchmark
   could not price falls back to the raw return rather than dropping off the board.

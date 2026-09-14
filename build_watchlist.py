@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Snapshot the current top-N ranked members from leaderboard.json into watchlist.json.
 
-Identity is carried through as the raw (Last, First, StateDst) index fields that
-build_leaderboard.py records, so watchlist_monitor.py can match future index rows
-directly -- no round-tripping through a formatted display name.
+Identity is carried through as the `member_key` build_leaderboard.py records -- the
+normalized (surname, district) pair that survives the index spelling a filer's name
+differently from one archive to the next -- so watchlist_monitor.py can match future
+index rows directly, with no round-trip through a formatted display name.
 
 Ranked on alpha by default rather than raw return: in a rising market the raw figure
 promotes whoever held the most beta, which is the opposite of what a watchlist is for.
@@ -46,9 +47,9 @@ def main() -> None:
 
     top = sorted(ranked, key=rank_key, reverse=True)[:args.top]
 
-    missing = [m["member"] for m in top if not m.get("last")]
+    missing = [m["member"] for m in top if not m.get("member_key")]
     if missing:
-        sys.exit(f"Leaderboard entries lack raw identity fields: {missing}. "
+        sys.exit(f"Leaderboard entries lack identity keys: {missing}. "
                  f"Regenerate leaderboard.json with the current build_leaderboard.py.")
 
     WATCHLIST_PATH.write_text(json.dumps({
@@ -59,6 +60,7 @@ def main() -> None:
         "members": [
             {
                 "member": m["member"],
+                "member_key": m["member_key"],
                 "last": m["last"],
                 "first": m["first"],
                 "state_dist": m["state_dist"],

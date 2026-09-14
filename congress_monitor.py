@@ -20,16 +20,21 @@ from house_disclosures import (
 )
 from monitor_common import (
     LATE_LEGEND,
+    PDF_ANNOUNCE,
+    PDF_GIVE_UP,
+    PDF_WAIT,
     STATE_DIR,
     add_common_args,
     any_late,
     escape_markdown,
     format_transaction,
-    load_seen_doc_ids,
+    load_alert_state,
     load_webhook_url,
     log,
+    pdf_wait_action,
     plural,
-    save_seen_doc_ids,
+    run_lock,
+    save_alert_state,
     seed_baseline,
     send_discord_message,
 )
@@ -50,7 +55,9 @@ def build_message(row: dict, transactions: list[dict]) -> str:
     lines = [f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure"]
 
     if not transactions:
-        # An unreadable PDF is not an empty filing, and the alert has to say which.
+        # An unreadable PDF is not an empty filing, and the alert has to say which. This
+        # is the give-up case: pdf_wait_action() has already spent a grace period waiting
+        # for the contents, so the reader is told to open the PDF themselves.
         lines += [
             f"Filed {filing_date} · transactions could not be read from the PDF",
             pdf_link,
@@ -78,13 +85,38 @@ def build_message(row: dict, transactions: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_landed_message(row: dict) -> str:
+    """The index-row-first alert: the filing exists, its PDF does not yet.
+
+    Worth sending on its own because the row appears in the archive before the document
+    is reachable, and an hourly poll catches that gap routinely. Saying "a filing landed"
+    minutes after it is indexed beats saying nothing until the PDF publishes, and the
+    transactions follow as a second alert once they can be read.
+    """
+    name = escape_markdown(format_filer_name(row))
+    return "\n".join([
+        f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure filed",
+        f"Filed {row.get('FilingDate', '?')} · contents not published yet; "
+        f"the transactions will follow when the PDF appears",
+        PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
+    ])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
     args = parser.parse_args()
 
+    # Hourly polling means a slow run can still be going when the next one starts, and
+    # both would read the same seen-set and post the same alert.
+    with run_lock("congress_monitor"):
+        run(args)
+
+
+def run(args) -> None:
     webhook_url = None if args.dry_run else load_webhook_url()
-    years = index_years(datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+    years = index_years(now)
 
     rows = fetch_index_years(years)
     ptr_rows = sorted(
@@ -101,18 +133,25 @@ def main() -> None:
                       f"PTR(s) for {', '.join(str(y) for y in years)}")
         return
 
-    seen = load_seen_doc_ids(STATE_PATH)
-    new_rows = [r for r in ptr_rows if r["DocID"] not in seen]
+    state = load_alert_state(STATE_PATH)
+
+    def persist() -> None:
+        if not args.dry_run:
+            save_alert_state(STATE_PATH, state)  # per alert, so a crash can't resend
+
+    # A filing announced but still missing its PDF stays out of `seen`, so it comes back
+    # here every run until it parses or the grace period runs out.
+    new_rows = [r for r in ptr_rows if r["DocID"] not in state.seen]
     backlog = max(0, len(new_rows) - args.max_alerts)
     if backlog:
         log(f"{len(new_rows)} new PTR(s) exceeds --max-alerts={args.max_alerts}; "
             f"posting {args.max_alerts} now, leaving {backlog} for the next run.")
         new_rows = new_rows[: args.max_alerts]
     if args.verbose:
-        print(f"-- {len(new_rows)} new PTR(s) to alert on --")
+        print(f"-- {len(new_rows)} new PTR(s) to alert on, {len(state.pending)} awaiting "
+              f"a PDF --")
 
-    sent = 0
-    skipped = 0
+    sent = announced = skipped = waiting = 0
     for row in new_rows:
         doc_id = row["DocID"]
         try:
@@ -122,41 +161,72 @@ def main() -> None:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
 
+        if not transactions:
+            action = pdf_wait_action(doc_id, state.pending, now, args.pending_grace)
+            if action == PDF_WAIT:
+                waiting += 1
+                if args.verbose:
+                    print(f"{doc_id}: PDF still unreadable, announced "
+                          f"{state.pending[doc_id]} — waiting")
+                continue
+            message = (build_landed_message(row) if action == PDF_ANNOUNCE
+                       else build_message(row, []))
+            if not deliver(message, doc_id, webhook_url, args):
+                continue
+            if action == PDF_ANNOUNCE:
+                announced += 1
+                state.pending[doc_id] = now.isoformat()
+            elif action == PDF_GIVE_UP:  # waited out the grace period, stop retrying
+                sent += 1
+                state.pending.pop(doc_id, None)
+                state.seen.add(doc_id)
+            persist()
+            continue
+
+        # The PDF published (possibly after an announcement), so the contents are known.
+        state.pending.pop(doc_id, None)
         alertable = transactions if args.all_assets else equity_transactions(transactions)
         # A filing we read fine that turned out to be all bonds and funds is handled, not
-        # failed: record it seen and say nothing. The unreadable case is the one that
-        # still alerts below, because "no stock trades" and "we could not tell" are
-        # different facts and only one of them is safe to keep quiet about.
-        if transactions and not alertable:
+        # failed: record it seen and say nothing. Only the unreadable case alerts, because
+        # "no stock trades" and "we could not tell" are different facts and only one of
+        # them is safe to keep quiet about.
+        if not alertable:
             skipped += 1
             if args.verbose or args.dry_run:
                 print(f"{doc_id}: {plural(len(transactions), 'transaction')}, "
                       f"none of them stocks — skipped")
-            if not args.dry_run:
-                seen.add(doc_id)
-                save_seen_doc_ids(STATE_PATH, seen)
+            state.seen.add(doc_id)
+            persist()
             continue
 
-        message = build_message(row, alertable)
-        if args.verbose or args.dry_run:
-            print(message)
-            print("---")
-        if args.dry_run:
-            sent += 1
+        if not deliver(build_message(row, alertable), doc_id, webhook_url, args):
             continue
-        try:
-            send_discord_message(webhook_url, message)
-            sent += 1
-        except requests.RequestException as exc:
-            print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
-            continue  # don't mark as seen if we couldn't alert
-        seen.add(doc_id)
-        save_seen_doc_ids(STATE_PATH, seen)  # persist per alert so a crash can't resend
+        sent += 1
+        state.seen.add(doc_id)
+        persist()
 
     verb = "Would send" if args.dry_run else "Sent"
     log(f"{verb} {sent} new PTR alert(s) out of {len(new_rows)} new filing(s)."
+        + (f" {announced} filing(s) announced ahead of their PDF." if announced else "")
+        + (f" {waiting} still awaiting a PDF." if waiting else "")
         + (f" {skipped} had no stock transactions." if skipped else "")
         + (f" {backlog} deferred." if backlog else ""))
+
+
+def deliver(message: str, doc_id: str, webhook_url: str | None, args) -> bool:
+    """Post one alert. False means the caller must not record the filing as handled --
+    a delivery that failed has to be retried, not swallowed."""
+    if args.verbose or args.dry_run:
+        print(message)
+        print("---")
+    if args.dry_run:
+        return True
+    try:
+        send_discord_message(webhook_url, message)
+    except requests.RequestException as exc:
+        print(f"Failed to send Discord message for {doc_id}: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 if __name__ == "__main__":

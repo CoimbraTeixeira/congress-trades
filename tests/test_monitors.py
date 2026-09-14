@@ -8,8 +8,9 @@ watchlist, or being read as "no purchases" when it was actually unreadable.
 """
 
 import sys
+import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,10 @@ import monitor_common  # noqa: E402
 from monitor_common import (  # noqa: E402
     DISCORD_MESSAGE_LIMIT,
     MAX_RETRY_SLEEP,
+    PDF_ANNOUNCE,
+    PDF_GIVE_UP,
+    PDF_WAIT,
+    AlertState,
     baseline_docids,
     escape_markdown,
     format_amount,
@@ -34,7 +39,11 @@ from monitor_common import (  # noqa: E402
     format_owner,
     format_transaction,
     is_within_window,
+    load_alert_state,
+    pdf_wait_action,
     plural,
+    run_lock,
+    save_alert_state,
     send_discord_message,
     shorten,
     split_message,
@@ -47,6 +56,107 @@ from daily_summary import (  # noqa: E402
     select_members,
     summarise_filing,
 )
+
+
+class PdfWaitActionTest(unittest.TestCase):
+    """An index row published ahead of its PDF used to consume the filing's only alert
+    on the minutes its contents were unavailable. Hourly polling hits that gap often."""
+
+    NOW = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+
+    def test_first_sighting_announces_the_filing(self):
+        self.assertEqual(pdf_wait_action("20034963", {}, self.NOW), PDF_ANNOUNCE)
+
+    def test_an_announced_filing_waits_rather_than_re_alerting(self):
+        pending = {"20034963": (self.NOW - timedelta(hours=3)).isoformat()}
+        self.assertEqual(pdf_wait_action("20034963", pending, self.NOW), PDF_WAIT)
+
+    def test_the_grace_period_ends_the_wait(self):
+        pending = {"20034963": (self.NOW - timedelta(hours=25)).isoformat()}
+        self.assertEqual(pdf_wait_action("20034963", pending, self.NOW), PDF_GIVE_UP)
+
+    def test_zero_grace_reports_unreadable_without_waiting(self):
+        # --pending-grace 0 restores the old behaviour for anyone who wants it.
+        pending = {"20034963": self.NOW.isoformat()}
+        self.assertEqual(pdf_wait_action("20034963", pending, self.NOW, 0), PDF_GIVE_UP)
+
+    def test_an_unreadable_timestamp_does_not_strand_the_filing(self):
+        # A state file written by hand, or by a build that stored something else: the
+        # filing must still resolve rather than being retried forever.
+        pending = {"20034963": "not a timestamp"}
+        self.assertEqual(pdf_wait_action("20034963", pending, self.NOW), PDF_GIVE_UP)
+
+    def test_a_naive_timestamp_is_read_as_utc(self):
+        pending = {"20034963": (self.NOW - timedelta(hours=1)).replace(tzinfo=None).isoformat()}
+        self.assertEqual(pdf_wait_action("20034963", pending, self.NOW), PDF_WAIT)
+
+
+class AlertStateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "state.json"
+
+    def test_round_trips_seen_pending_and_membership(self):
+        save_alert_state(self.path, AlertState(
+            seen={"a", "b"}, pending={"c": "2026-09-14T12:00:00+00:00"},
+            members={("pelosi", "CA11")}))
+        state = load_alert_state(self.path)
+        self.assertEqual(state.seen, {"a", "b"})
+        self.assertEqual(state.pending, {"c": "2026-09-14T12:00:00+00:00"})
+        self.assertEqual(state.members, {("pelosi", "CA11")})
+
+    def test_reads_the_legacy_bare_list(self):
+        # congress_monitor's state file was a plain DocID list; upgrading must not
+        # re-alert on the entire back catalogue.
+        self.path.write_text('["a", "b"]')
+        self.assertEqual(load_alert_state(self.path).seen, {"a", "b"})
+
+    def test_reads_a_dict_without_pending(self):
+        self.path.write_text('{"seen": ["a"], "baselined_members": [["moore", "NC14"]]}')
+        state = load_alert_state(self.path)
+        self.assertEqual((state.seen, state.pending), ({"a"}, {}))
+        self.assertEqual(state.members, {("moore", "NC14")})
+
+    def test_missing_file_is_an_empty_state(self):
+        state = load_alert_state(self.path)
+        self.assertEqual((state.seen, state.pending, state.members), (set(), {}, set()))
+
+
+class RunLockTest(unittest.TestCase):
+    """Hourly cron plus a slow run means two processes can overlap; both would read the
+    same seen-set and post the same alert."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.object(monitor_common, "STATE_DIR", Path(self.tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_second_run_exits_instead_of_double_posting(self):
+        with run_lock("congress_monitor"):
+            with self.assertRaises(SystemExit) as caught:
+                with run_lock("congress_monitor"):
+                    self.fail("the second run entered the critical section")
+        self.assertEqual(caught.exception.code, 0)  # a skipped poll is not an error
+
+    def test_the_lock_is_released_when_the_run_finishes(self):
+        with run_lock("congress_monitor"):
+            pass
+        with run_lock("congress_monitor"):
+            pass  # reacquiring must work, including after an exception
+
+    def test_a_crashing_run_still_releases_the_lock(self):
+        with self.assertRaises(RuntimeError):
+            with run_lock("congress_monitor"):
+                raise RuntimeError("boom")
+        with run_lock("congress_monitor"):
+            pass
+
+    def test_different_monitors_do_not_block_each_other(self):
+        with run_lock("congress_monitor"), run_lock("watchlist_monitor"):
+            pass
 
 
 def txn(**kwargs):
@@ -311,7 +421,7 @@ class BaselineDocidsTest(unittest.TestCase):
         {"DocID": "new", "FilingDate": "7/30/2026", "Last": "A", "First": "X", "StateDst": "XX01"},
         {"DocID": "other", "FilingDate": "1/8/2026", "Last": "B", "First": "Y", "StateDst": "YY02"},
     ]
-    MEMBER_A = {("A", "X", "XX01")}
+    MEMBER_A = {("a", "XX01")}
 
     def test_only_stale_filings_of_new_members_are_baselined(self):
         self.assertEqual(baseline_docids(self.ROWS, self.MEMBER_A, self.NOW, 7), {"old"})

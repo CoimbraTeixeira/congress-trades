@@ -10,7 +10,7 @@ lookup's boundaries, the matching arithmetic, and the benchmark comparison.
 
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -19,11 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build_leaderboard import (  # noqa: E402
     BENCHMARK_TICKER,
-    MAX_PRICE_LOOKBACK_YEARS,
     PRICE_WINDOW_RUN_IN_DAYS,
     PriceBook,
+    in_performance_window,
     price_window_start,
     score_member,
+)
+from house_disclosures import (  # noqa: E402
+    performance_index_years,
+    performance_window_start,
 )
 
 
@@ -94,39 +98,79 @@ class PriceLookup(unittest.TestCase):
         self.assertEqual(self.prices.latest("AAA"), 120.0)
 
 
+class PerformanceWindow(unittest.TestCase):
+    """Scope is a trailing window on the TRANSACTION date. The archives are fetched by
+    filing year and reach years further back than the window they are read for, so this
+    filter is the only thing that makes "the last 3 years" mean what it says."""
+
+    NOW = datetime(2026, 9, 14, 11, 30, tzinfo=timezone.utc)
+    START = datetime(2023, 9, 14)
+    END = datetime(2026, 9, 14)
+
+    def test_window_starts_that_many_years_back_to_the_day(self):
+        self.assertEqual(performance_window_start(self.NOW, 3), self.START)
+
+    def test_leap_day_start_lands_in_a_non_leap_year(self):
+        self.assertEqual(
+            performance_window_start(datetime(2024, 2, 29, tzinfo=timezone.utc), 3),
+            datetime(2021, 2, 28))
+
+    def test_every_archive_that_can_hold_an_in_window_trade_is_read(self):
+        # A trade from Oct 2023 was filed in 2023, so the 2023 archive is in scope even
+        # though the window opens partway through it.
+        self.assertEqual(performance_index_years(self.NOW, 3), [2026, 2025, 2024, 2023])
+
+    def test_a_prior_year_trade_disclosed_late_is_still_scored(self):
+        # The 45-day deadline alone puts December trades in the next year's archive.
+        self.assertTrue(in_performance_window(
+            txn("AAA", "Purchase", "12/20/2023", 10_000), self.START, self.END))
+
+    def test_a_trade_older_than_the_window_is_dropped(self):
+        self.assertFalse(in_performance_window(
+            txn("AAA", "Purchase", "06/30/2023", 10_000), self.START, self.END))
+
+    def test_a_misparsed_ancient_date_is_dropped_rather_than_priced(self):
+        self.assertFalse(in_performance_window(
+            txn("AAA", "Purchase", "01/01/1900", 10_000), self.START, self.END))
+
+    def test_an_unreadable_date_is_dropped(self):
+        self.assertFalse(in_performance_window(
+            txn("AAA", "Purchase", "garbage", 10_000), self.START, self.END))
+
+    def test_a_future_date_is_dropped(self):
+        self.assertFalse(in_performance_window(
+            txn("AAA", "Purchase", "01/04/2027", 10_000), self.START, self.END))
+
+
 class PriceWindow(unittest.TestCase):
-    def test_opens_before_the_earliest_trade_not_at_january(self):
-        start = price_window_start([txn("AAA", "Purchase", "02/07/2025", 10_000)], 2026)
-        self.assertLess(datetime.fromisoformat(start), datetime(2025, 2, 7))
+    WINDOW_START = datetime(2023, 9, 14)
+
+    def test_opens_before_the_window_start_so_its_oldest_trade_prices(self):
+        start = datetime.fromisoformat(price_window_start(
+            [txn("AAA", "Purchase", "09/14/2023", 10_000)], self.WINDOW_START))
+        self.assertLess(start, self.WINDOW_START)
+        self.assertLessEqual((self.WINDOW_START - start).days, PRICE_WINDOW_RUN_IN_DAYS)
 
     def test_run_in_covers_a_trade_dated_on_a_non_trading_day(self):
         """on() rolls forward, so the window has to open strictly before the oldest
         trade -- otherwise a Saturday-dated trade is the one trade that falls off."""
-        saturday = "05/17/2025"
-        start = datetime.fromisoformat(
-            price_window_start([txn("AAA", "Purchase", saturday, 10_000)], 2026))
-        self.assertLess(start, datetime(2025, 5, 17))
-        self.assertLessEqual((datetime(2025, 5, 17) - start).days,
-                             PRICE_WINDOW_RUN_IN_DAYS + 1)
+        saturday = datetime(2025, 5, 17)
+        start = datetime.fromisoformat(price_window_start(
+            [txn("AAA", "Purchase", "05/17/2025", 10_000)], self.WINDOW_START))
+        self.assertLess(start, saturday)
+        self.assertLessEqual((saturday - start).days, PRICE_WINDOW_RUN_IN_DAYS + 1)
 
-    def test_never_opens_later_than_the_filing_year(self):
-        """All trades late in the year still get a full-year window; unsold lots are
-        marked across it and the year is the reporting period."""
-        start = price_window_start([txn("AAA", "Purchase", "11/03/2026", 10_000)], 2026)
-        self.assertLess(datetime.fromisoformat(start), datetime(2026, 1, 1))
+    def test_no_closes_are_fetched_before_the_oldest_trade_in_the_window(self):
+        """Every trade being newer than the window start is the common case -- 3 years
+        of closes for 700 tickers is the download, so it opens where the data starts."""
+        start = datetime.fromisoformat(price_window_start(
+            [txn("AAA", "Purchase", "03/04/2026", 10_000)], self.WINDOW_START))
+        self.assertGreater(start, datetime(2026, 1, 1))
 
-    def test_a_misparsed_ancient_date_does_not_widen_the_window(self):
-        txns = [txn("AAA", "Purchase", "01/01/1900", 10_000),
-                txn("AAA", "Purchase", "03/04/2026", 10_000)]
-        start = datetime.fromisoformat(price_window_start(txns, 2026))
-        self.assertGreater(start, datetime(2026 - MAX_PRICE_LOOKBACK_YEARS - 1, 1, 1))
-
-    def test_no_parseable_dates_falls_back_to_the_filing_year(self):
-        start = price_window_start([txn("AAA", "Purchase", "garbage", 10_000)], 2026)
-        self.assertLess(datetime.fromisoformat(start), datetime(2026, 1, 1))
-
-    def test_no_transactions_at_all(self):
-        self.assertTrue(price_window_start([], 2026).startswith("2025-12"))
+    def test_no_transactions_at_all_falls_back_to_the_window_start(self):
+        start = datetime.fromisoformat(price_window_start([], self.WINDOW_START))
+        self.assertLess(start, self.WINDOW_START)
+        self.assertLessEqual((self.WINDOW_START - start).days, PRICE_WINDOW_RUN_IN_DAYS)
 
 
 class Scoring(unittest.TestCase):

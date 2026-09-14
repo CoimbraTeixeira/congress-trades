@@ -1,12 +1,15 @@
 """Shared plumbing for the Discord monitors: webhook config, seen-doc state, delivery,
 and the formatting every alert renders its transactions with."""
 
+import fcntl
 import json
 import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -44,6 +47,12 @@ MAX_RETRY_SLEEP = 30.0
 # signal we're watching for. Filings this recent stay alertable.
 DEFAULT_BASELINE_WINDOW_DAYS = 7
 
+# How long a filing may sit indexed-but-unreadable before the monitors stop waiting and
+# say so. The Clerk routinely publishes an index row before its PDF is reachable, which
+# an hourly poll hits often and a daily poll almost never did; a day's grace covers the
+# publish gap without sitting on a genuinely broken filing forever.
+PENDING_GRACE_HOURS = 24
+
 
 def log(message: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] {message}")
@@ -69,45 +78,30 @@ def load_webhook_url() -> str:
     return url
 
 
-def load_seen_doc_ids(path: Path) -> set[str]:
-    """Read the seen-DocID set. A corrupt state file is quarantined and the run aborts:
-    treating it as empty would re-alert on the entire back catalogue."""
+@dataclass
+class AlertState:
+    """What a monitor remembers between runs, in one shape for all three of them.
+
+    `seen` is handled filings. `pending` is filings indexed without a readable PDF yet,
+    mapped to the moment they were first sighted, so the contents can be alerted when
+    they publish instead of the alert being spent on the gap. `members` is the watched
+    set as of the last run -- what stops a watchlist rotation from replaying a newly
+    promoted member's back catalogue (unused by congress_monitor, which watches everyone).
+    """
+
+    seen: set[str] = field(default_factory=set)
+    pending: dict[str, str] = field(default_factory=dict)
+    members: set[tuple] = field(default_factory=set)
+
+
+def load_alert_state(path: Path) -> AlertState:
+    """Read a monitor's state. A corrupt file is quarantined and the run aborts: treating
+    it as empty would re-alert on the entire back catalogue.
+
+    Tolerates both legacy shapes -- a bare DocID list, and a dict without `pending`.
+    """
     if not path.exists():
-        return set()
-    try:
-        return set(json.loads(path.read_text()))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        quarantine = path.with_suffix(path.suffix + ".corrupt")
-        path.rename(quarantine)
-        sys.exit(
-            f"Corrupt state file {path} ({exc}); moved to {quarantine}. "
-            f"The next run will re-seed a baseline without alerting."
-        )
-
-
-def save_seen_doc_ids(path: Path, doc_ids: set[str]) -> None:
-    """Write atomically -- a crash mid-write would otherwise truncate the state file
-    and cost us the whole seen-set."""
-    write_json(path, sorted(doc_ids))
-
-
-def write_json(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload))
-    os.replace(tmp, path)
-
-
-def load_watch_state(path: Path) -> tuple[set[str], set[tuple]]:
-    """Seen DocIDs plus the watchlist membership as of the last run.
-
-    Recording who was watched is what stops a watchlist rotation from replaying a newly
-    promoted member's entire back catalogue as fresh alerts. It is last run's membership
-    rather than a growing union, so a member who drops off and returns is baselined again
-    instead of replaying their absence.
-    Tolerates the legacy bare-list format (all DocIDs, no member record)."""
-    if not path.exists():
-        return set(), set()
+        return AlertState()
     try:
         raw = json.loads(path.read_text())
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -117,16 +111,90 @@ def load_watch_state(path: Path) -> tuple[set[str], set[tuple]]:
             f"Corrupt state file {path} ({exc}); moved to {quarantine}. "
             f"The next run will re-seed a baseline without alerting."
         )
-    if isinstance(raw, list):  # legacy format
-        return set(raw), set()
-    return set(raw.get("seen", [])), {tuple(m) for m in raw.get("baselined_members", [])}
+    if isinstance(raw, list):  # legacy: seen DocIDs only
+        return AlertState(seen=set(raw))
+    return AlertState(
+        seen=set(raw.get("seen", [])),
+        pending={str(k): str(v) for k, v in (raw.get("pending") or {}).items()},
+        members={tuple(m) for m in raw.get("baselined_members", [])},
+    )
 
 
-def save_watch_state(path: Path, seen: set[str], baselined: set[tuple]) -> None:
+def save_alert_state(path: Path, state: AlertState) -> None:
+    """Write atomically -- a crash mid-write would otherwise truncate the state file and
+    cost us the whole seen-set."""
     write_json(path, {
-        "seen": sorted(seen),
-        "baselined_members": sorted(list(m) for m in baselined),
+        "seen": sorted(state.seen),
+        "pending": {k: state.pending[k] for k in sorted(state.pending)},
+        "baselined_members": sorted(list(m) for m in state.members),
     })
+
+
+def write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+
+
+@contextmanager
+def run_lock(name: str):
+    """Serialise runs of one monitor, so an hourly schedule cannot double-post.
+
+    A run that outlives its slot -- a slow Clerk, a few hundred PDFs, a Discord 429
+    backoff -- would otherwise overlap the next one, and both processes would read the
+    same seen-set and post the same alert. The second run exits 0 rather than failing:
+    a skipped poll is not an error, and cron mailing about it every hour would be.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / f"{name}.lock"
+    handle = path.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        log(f"Another {name} run still holds {path}; exiting rather than double-posting.")
+        sys.exit(0)
+    try:
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+# What to do about a filing that is indexed but whose PDF did not parse.
+PDF_ANNOUNCE = "announce"   # first sighting: say it landed, contents to follow
+PDF_WAIT = "wait"           # already announced, still inside the grace period
+PDF_GIVE_UP = "give-up"     # waited out the grace period: report it as unreadable
+
+
+def pdf_wait_action(doc_id: str, pending: dict[str, str], now: datetime,
+                    grace_hours: int = PENDING_GRACE_HOURS) -> str:
+    """Whether to announce, keep waiting for, or give up on an unreadable filing.
+
+    The Clerk publishes an index row before the PDF is reachable often enough that an
+    hourly poll sees it routinely. Alerting "transactions could not be read" and marking
+    the filing handled would spend its only notification on the minutes the contents
+    weren't published yet, so the first sighting announces the filing and the contents
+    follow when they appear. A PDF still unreadable after the grace period is genuinely
+    broken, and that gets said once rather than retried forever.
+    """
+    first_seen = parse_iso(pending.get(doc_id))
+    if first_seen is None:
+        return PDF_ANNOUNCE if doc_id not in pending else PDF_GIVE_UP
+    return PDF_GIVE_UP if now - first_seen >= timedelta(hours=grace_hours) else PDF_WAIT
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    """An ISO timestamp from state, always returned UTC-aware. A value written by an
+    older build without an offset is read as UTC rather than crashing the comparison."""
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
 def is_within_window(row: dict, now: datetime, window_days: int) -> bool:
@@ -377,9 +445,17 @@ def send_discord_message(webhook_url: str, text: str) -> None:
 
 
 def seed_baseline(path: Path, doc_ids: set[str], label: str) -> None:
-    save_seen_doc_ids(path, doc_ids)
+    save_alert_state(path, AlertState(seen=set(doc_ids)))
     log(f"First run: seeded baseline with {len(doc_ids)} existing {label}, no alerts "
         f"sent. Future runs will alert on genuinely new filings.")
+
+
+def add_pending_grace_arg(parser) -> None:
+    """How long to wait for a filing's PDF to publish before reporting it unreadable."""
+    parser.add_argument("--pending-grace", type=int, default=PENDING_GRACE_HOURS,
+                        help=f"Hours to keep retrying a filing whose PDF has not "
+                             f"published yet (default {PENDING_GRACE_HOURS}); 0 reports "
+                             f"it as unreadable on the first sighting")
 
 
 def add_all_assets_arg(parser) -> None:
@@ -399,3 +475,4 @@ def add_common_args(parser) -> None:
                         help=f"Cap alerts per run (default {DEFAULT_MAX_ALERTS}); "
                              f"the remainder is left for the next run")
     add_all_assets_arg(parser)
+    add_pending_grace_arg(parser)

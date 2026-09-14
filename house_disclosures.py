@@ -5,6 +5,7 @@ Data source: the House Clerk's public bulk disclosure archive
 Covers House only -- the Senate's eFD site prohibits bulk/automated access.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ import threading
 import zipfile
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -29,6 +31,19 @@ LATE_FILING_DAYS = 45
 
 # How far into a new year to keep reading the previous year's index (see index_years).
 INDEX_OVERLAP_DAYS = 60
+
+# The trailing window, in years, that "recent performance" means: a ranking is only
+# useful if it covers long enough for picks to play out, and stale enough members to
+# drop off. Defined on the TRANSACTION date, not the filing year -- see
+# performance_index_years.
+PERFORMANCE_WINDOW_YEARS = 3
+
+# Extracted PDF text, cached on disk and keyed by the DocID it came from. A published
+# filing never changes, and the performance window re-reads a few thousand PTRs on every
+# rebuild; without the cache that is a few thousand downloads plus pdftotext runs a day
+# against the Clerk's site for text that cannot have moved.
+PTR_TEXT_CACHE_DIR = Path(__file__).resolve().parent / "cache" / "ptr_text"
+_SAFE_DOC_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 # House asset-type codes (fd.house.gov/reference/asset-type-codes.aspx) that denote
 # something with a US equity ticker. Everything else -- GS (government securities),
@@ -93,6 +108,10 @@ TICKER_RE = re.compile(r"\(([A-Z]{1,5}(?:[.\-][A-Z]{1,2})?)\)")
 MAX_CONTINUATION_LINES = 4
 
 TXN_TYPES = {"P": "Purchase", "S": "Sale", "E": "Exchange"}
+# The two directions a position can move in. `Exchange` is a reshuffle inside a holding
+# -- a fund share class swap, a merger's share conversion -- with no side and no price
+# to score, so it is never a buy or a sell.
+TRADE_TXN_TYPES = ("Purchase", "Sale")
 
 _HEADER_TOKENS = {
     "id", "owner", "asset", "transaction", "type", "notification", "date",
@@ -184,6 +203,14 @@ def equity_transactions(transactions: list[dict]) -> list[dict]:
     return [t for t in transactions if is_equity_transaction(t)]
 
 
+def trade_transactions(transactions: list[dict]) -> list[dict]:
+    """The buy/sell rows in a filing. A transaction that is neither is disclosed in the
+    same table but says nothing about a pick: an Exchange has no direction, and the
+    leaderboard, the digest and the buy alerts all read this rather than the raw table
+    so "a trade" means the same thing in all three."""
+    return [t for t in transactions if t.get("type") in TRADE_TXN_TYPES]
+
+
 def fetch_index(year: int) -> list[dict]:
     resp = _session().get(INDEX_URL_TMPL.format(year=year), timeout=30)
     resp.raise_for_status()
@@ -220,6 +247,32 @@ def index_years(now: datetime) -> list[int]:
     return years
 
 
+def performance_window_start(now: datetime, years: int = PERFORMANCE_WINDOW_YEARS) -> datetime:
+    """Midnight `years` years before `now`, naive.
+
+    Naive and floored to the day because it is compared against transaction dates
+    parsed out of the filings, which carry neither a time nor a zone.
+    """
+    anchor = now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        return anchor.replace(year=anchor.year - years)
+    except ValueError:  # Feb 29 -> the target year isn't a leap year
+        return anchor.replace(year=anchor.year - years, day=28)
+
+
+def performance_index_years(now: datetime,
+                            years: int = PERFORMANCE_WINDOW_YEARS) -> list[int]:
+    """The index years that can hold a transaction inside the trailing window.
+
+    A filing lands in the archive for the year it was *filed*, which is never earlier
+    than the year the trade happened, so covering trades back to the window's start
+    means reading every archive from that year forward. Newest first, so where the same
+    DocID appears twice the fresher index row wins.
+    """
+    start = performance_window_start(now, years)
+    return list(range(now.year, start.year - 1, -1))
+
+
 def fetch_index_years(years: list[int]) -> list[dict]:
     """Merge several years of index rows, first occurrence of a DocID winning."""
     rows: list[dict] = []
@@ -241,9 +294,45 @@ def filing_sort_key(row: dict) -> tuple:
     return (filed or datetime.max, row.get("DocID", ""))
 
 
-def fetch_ptr_text(year: int | str, doc_id: str) -> str | None:
+def _cached_text_path(year: int | str, doc_id: str) -> Path | None:
+    """Where this filing's extracted text lives, or None if the DocID cannot be trusted
+    as a filename -- the index is fetched over the network, so it is not our string."""
+    if not _SAFE_DOC_ID_RE.match(str(doc_id)) or not _SAFE_DOC_ID_RE.match(str(year)):
+        return None
+    return PTR_TEXT_CACHE_DIR / str(year) / f"{doc_id}.txt"
+
+
+def _write_cached_text(path: Path, text: str) -> None:
+    """Publish cached text atomically. build_leaderboard fetches from a thread pool and
+    several omp/cron runs can overlap, so a half-written file must never be readable."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, suffix=".tmp",
+                                         delete=False) as f:
+            f.write(text)
+            tmp = f.name
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a cache that cannot be written is a slow run, not a failed one
+
+
+def fetch_ptr_text(year: int | str, doc_id: str, use_cache: bool = True) -> str | None:
+    """The filing's PDF as `pdftotext -layout` text, cached on disk by DocID.
+
+    Only a successful, non-empty extraction is cached: a 404 (the Clerk publishes index
+    rows slightly ahead of some PDFs), a fetch error or an unreadable PDF must be
+    retried on the next run, and caching "" would make a transient failure permanent.
+    """
     if shutil.which("pdftotext") is None:
         sys.exit("pdftotext not found -- install poppler-utils (apt install poppler-utils)")
+    cache_path = _cached_text_path(year, doc_id) if use_cache else None
+    if cache_path is not None:
+        try:
+            cached = cache_path.read_text()
+        except OSError:
+            cached = ""
+        if cached:
+            return cached
     resp = _session().get(PDF_URL_TMPL.format(year=year, doc_id=doc_id), timeout=30)
     if resp.status_code != 200 or not resp.content:
         return None
@@ -254,7 +343,11 @@ def fetch_ptr_text(year: int | str, doc_id: str) -> str | None:
             ["pdftotext", "-layout", f.name, "-"],
             capture_output=True, text=True, timeout=30,
         )
-    return result.stdout if result.returncode == 0 else None
+    if result.returncode != 0:
+        return None
+    if cache_path is not None and result.stdout:
+        _write_cached_text(cache_path, result.stdout)
+    return result.stdout
 
 
 def _is_page_furniture(line: str) -> bool:
@@ -409,6 +502,37 @@ def format_filer_name(row: dict) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-def member_key(row: dict) -> tuple[str, str, str]:
-    """Stable identity for a filer across index rows -- raw fields, not display name."""
-    return (row.get("Last", ""), row.get("First", ""), row.get("StateDst", ""))
+# Titles, honorifics and post-nominals the index sprays across its name fields. They are
+# not part of anybody's identity, and which of them appear changes from archive to
+# archive for the same filer.
+_NAME_NOISE_TOKENS = frozenset({
+    "mr", "mrs", "ms", "miss", "dr", "hon", "rep", "sen", "the", "honorable",
+    "jr", "sr", "ii", "iii", "iv", "md", "do", "dds", "dmd", "phd", "facs", "cpa", "esq",
+})
+
+
+def normalize_name_part(value: str) -> str:
+    """A name field reduced to what identifies the person, lowercase.
+
+    The index's Last/First fields are not stable between archives. The same filer is
+    `Greene / Marjorie Taylor` in one year and `Greene / Marjorie Taylor Mrs` in the
+    next; `Franklin / C. Scott` and `Franklin / Scott Scott`; `Dunn, MD, FACS / Neal
+    Patrick` and `Dunn / Neal Patrick MD, Facs`. Reading one year at a time never showed
+    it -- reading three splits a member into two rows, halves each half's trade history
+    and spends two watchlist slots on one person.
+    """
+    tokens = (t.strip(".,").lower() for t in value.replace(",", " ").split())
+    return " ".join(t for t in tokens if t and t not in _NAME_NOISE_TOKENS)
+
+
+def member_key(row: dict) -> tuple[str, str]:
+    """Stable identity for a filer across archives: normalized surname plus district.
+
+    The first name is deliberately not part of it -- `C. Scott` and `Scott Scott` are
+    the same representative, and no normalization of those two agrees. The district is
+    what keeps two same-surname members apart, and the House seats one member per
+    district, so the pair is unique among sitting filers. The cost is that a member
+    succeeded in their own district by someone of the same surname would merge; the
+    alternative cost was Marjorie Taylor Greene ranking twice on half a record each.
+    """
+    return (normalize_name_part(row.get("Last", "")), row.get("StateDst", ""))
