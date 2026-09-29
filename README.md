@@ -53,7 +53,8 @@ the `core.hooksPath` line above is required once per clone. Bypass a false posit
 Typical order:
 
 ```bash
-python3 congress_monitor.py --dry-run     # first run seeds a baseline, no alerts
+python3 congress_monitor.py --dry-run     # preview only; never writes monitor state
+python3 congress_monitor.py               # first real run seeds a baseline, no alerts
 python3 build_leaderboard.py              # ~70s cold, ~40s warm: 3 years of PTRs + prices
 python3 build_watchlist.py
 python3 build_dashboard.py
@@ -236,10 +237,11 @@ artefacts.
 
 ## The daily digest
 
-`daily_summary.py` posts one Discord message a day covering the top-N leaderboard
-members: a roll-up of tickers more than one member touched, then a per-member buy/sell
-breakdown with PDF links. Where the two monitors alert per filing as it lands, this is
-the once-a-day read across the wider field.
+`daily_summary.py` posts one digest a day covering the top-N leaderboard members:
+a roll-up of tickers more than one member touched, then a per-member buy/sell breakdown
+with PDF links. One digest is capped at three Discord messages; whole filings that do not
+fit remain unseen for the next run. Where the two monitors alert per filing as it lands,
+this is the once-a-day read across the wider field.
 
 ```bash
 python3 daily_summary.py --top 50                  # default: ranked by alpha
@@ -267,10 +269,11 @@ are handled and the excess is left for the next run rather than dropped) and
 `--pending-grace H` (default 24 — see *Polling and the publish gap* below).
 `watchlist_monitor.py` also takes `--baseline-window N` (default 7) — see below.
 
-The first run of a monitor records every existing filing as "seen" and sends
+The first non-dry run of a monitor records every existing filing as "seen" and sends
 nothing, so you don't get alerted on the whole back catalogue. State lives in
-`state/` and is written atomically; a corrupt state file is quarantined to
-`*.corrupt` and the next run re-seeds a baseline instead of re-alerting on everything.
+`state/` and is written atomically; JSON structure as well as syntax is validated.
+A corrupt state file is quarantined to `*.corrupt` and the next run re-seeds a baseline
+instead of re-alerting on everything.
 
 Both monitors read the previous year's index as well as the current one for the first
 60 days of a new year. Each year is a separate archive, so a PTR filed on Dec 30 stays
@@ -371,17 +374,18 @@ a page break.
 silently not alerted (wrong index year, baselined on promotion, read as "no purchases"
 when it was really unreadable) — plus what hourly polling added: the publish-gap state
 machine (announce once, wait silently, give up after the grace period, and resolve a
-corrupt or naive timestamp rather than retrying forever), the state file's two legacy
-formats, and the run lock releasing on both a clean exit and a crash.
+corrupt or naive timestamp rather than retrying forever), strict state shape validation
+with both legacy formats, dry-run immutability, digest overflow deferral, and the run lock
+releasing on both a clean exit and a crash.
 
-`tests/test_leaderboard.py` covers the scoring engine: the FIFO matcher, the price
-lookup's boundaries, the benchmark comparison, and the three-year window itself — that a
-prior-year trade disclosed late is still scored, and that a trade older than the window
-(or ancient through a misparse, or future-dated) is dropped rather than priced. The
-parser had tests from the start and the scorer had none, which is how a trade dated
-before the fetched price window came to be priced at the first close of the filing year
-— silently wrong rather than merely missing, for 23% of matched lots. Both halves of
-that fix have a regression test here.
+`tests/test_leaderboard.py` covers the scoring and accounting engine: the FIFO matcher,
+price lookup boundaries, benchmark comparison, all-asset traded volume, failed-PTR
+reporting, and the three-year window itself — that a prior-year trade disclosed late is
+still scored, and that a trade older than the window (or ancient through a misparse, or
+future-dated) is dropped rather than priced. The parser had tests from the start and the
+scorer had none, which is how a trade dated before the fetched price window came to be
+priced at the first close of the filing year — silently wrong rather than merely missing,
+for 23% of matched lots. Both halves of that fix have a regression test here.
 
 `tests/test_house_disclosures.py` also pins the two things the multi-year window added:
 filer identity — the real Greene/Franklin/Dunn spelling variants collapse to one member
@@ -411,25 +415,29 @@ amount or a share count.
   that can hold one — see *The three-year window* above. Rows outside it are counted in
   `totals.out_of_window_lines` and scored nowhere.
 - The price series opens at the **window's start**, or at the oldest trade inside it when
-  every trade is newer, never at January 1. A price the series does not cover is reported
-  as `unpriced_trades` rather than answered with the first close we happen to hold.
+  every trade is newer, never at January 1. The download end is tomorrow because Yahoo's
+  `end` is exclusive, so the latest completed close is included. A price the series does
+  not cover is reported as `unpriced_trades`, not answered with the first held close.
 - Sales exceeding matched buys were opened before the window, have unknown cost
   basis, and are excluded. Many members are sell-only across the whole window and so
   have no computable return at all.
 - Unsold shares are marked to the latest close — hypothetical, not cashed out.
   All prices come from the same split/dividend-adjusted series, so history and
   "today" are comparable.
-- Non-equity assets (treasuries, municipal bonds, funds, crypto) are counted as
-  trades but excluded from gains. Ticker resolution by company name is gated on
-  the filing's asset-type code, because a name lookup will cheerfully match
-  "US Treasury Note" to some unrelated equity.
+- Non-equity assets (treasuries, municipal bonds, funds, crypto) and unresolved tickers
+  are counted in `total_trades` and `traded_total_estimate` but excluded from gains.
+  Ticker resolution by company name is gated on the filing's asset-type code, because a
+  name lookup will cheerfully match "US Treasury Note" to some unrelated equity.
+- Every PTR filer appears in `leaderboard.json`, including members with no parsed or
+  priceable trades. `totals.ptr_failures` exposes PDFs that could not be fetched or
+  parsed rather than making a partial build look complete.
 - Members are **ranked** only above `--min-invested` / `--min-trades` thresholds;
   otherwise a single lucky $15k trade tops the board. Both count across the whole
   window, so three years of trading clears them more easily than one year did.
   Unranked members still appear in `leaderboard.json` and greyed in the dashboard table.
-- `build_watchlist.py` and `daily_summary.py` both rank on alpha by default and take
-  `--rank-by return` to go back to the raw figure. A member whose lots the benchmark
-  could not price falls back to the raw return rather than dropping off the board.
+- `build_watchlist.py` ranks on alpha by default and takes `--rank-by return` for the raw
+  figure. `daily_summary.py --rank-by volume` instead ranks every filer by all in-window
+  buy/sell volume, including non-equities and unresolved tickers.
 - Filers have up to 45 days to report, so recent trades may not appear yet.
 
 Not investment advice.

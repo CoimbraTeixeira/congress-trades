@@ -94,9 +94,17 @@ class AlertState:
     members: set[tuple] = field(default_factory=set)
 
 
+def _quarantine_state(path: Path, exc: Exception) -> None:
+    quarantine = path.with_suffix(path.suffix + ".corrupt")
+    path.rename(quarantine)
+    sys.exit(
+        f"Corrupt state file {path} ({exc}); moved to {quarantine}. "
+        f"The next run will re-seed a baseline without alerting."
+    )
+
+
 def load_alert_state(path: Path) -> AlertState:
-    """Read a monitor's state. A corrupt file is quarantined and the run aborts: treating
-    it as empty would re-alert on the entire back catalogue.
+    """Read state, validating its shape before it can suppress or replay alerts.
 
     Tolerates both legacy shapes -- a bare DocID list, and a dict without `pending`.
     """
@@ -104,20 +112,36 @@ def load_alert_state(path: Path) -> AlertState:
         return AlertState()
     try:
         raw = json.loads(path.read_text())
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
-        quarantine = path.with_suffix(path.suffix + ".corrupt")
-        path.rename(quarantine)
-        sys.exit(
-            f"Corrupt state file {path} ({exc}); moved to {quarantine}. "
-            f"The next run will re-seed a baseline without alerting."
+        if isinstance(raw, list):
+            if not all(isinstance(doc_id, str) for doc_id in raw):
+                raise ValueError("legacy state must contain only DocID strings")
+            return AlertState(seen=set(raw))
+        if not isinstance(raw, dict):
+            raise ValueError("expected a JSON object")
+        seen = raw.get("seen", [])
+        pending = raw.get("pending", {})
+        members = raw.get("baselined_members", [])
+        if not isinstance(seen, list) or not all(isinstance(doc_id, str) for doc_id in seen):
+            raise ValueError("'seen' must be an array of DocID strings")
+        if not isinstance(pending, dict) or not all(
+            isinstance(doc_id, str) and isinstance(stamp, str)
+            for doc_id, stamp in pending.items()
+        ):
+            raise ValueError("'pending' must map DocID strings to timestamp strings")
+        if not isinstance(members, list) or not all(
+            isinstance(member, list)
+            and len(member) == 2
+            and all(isinstance(value, str) for value in member)
+            for member in members
+        ):
+            raise ValueError("'baselined_members' must contain two-string arrays")
+        return AlertState(
+            seen=set(seen),
+            pending=dict(pending),
+            members={tuple(member) for member in members},
         )
-    if isinstance(raw, list):  # legacy: seen DocIDs only
-        return AlertState(seen=set(raw))
-    return AlertState(
-        seen=set(raw.get("seen", [])),
-        pending={str(k): str(v) for k, v in (raw.get("pending") or {}).items()},
-        members={tuple(m) for m in raw.get("baselined_members", [])},
-    )
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        _quarantine_state(path, exc)
 
 
 def save_alert_state(path: Path, state: AlertState) -> None:

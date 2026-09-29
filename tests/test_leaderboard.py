@@ -8,19 +8,25 @@ priced at the first close of the filing year for 23% of matched lots. These cove
 lookup's boundaries, the matching arithmetic, and the benchmark comparison.
 """
 
+import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import build_leaderboard  # noqa: E402
 
 from build_leaderboard import (  # noqa: E402
     BENCHMARK_TICKER,
     PRICE_WINDOW_RUN_IN_DAYS,
     PriceBook,
+    activity_metrics,
+    collect_transactions,
     in_performance_window,
     price_window_start,
     score_member,
@@ -324,6 +330,69 @@ class Benchmark(unittest.TestCase):
         self.assertAlmostEqual(result["benchmark_gain_estimate"], 1_500.0)
         self.assertAlmostEqual(result["benchmark_return_pct_estimate"], 10.0)
         self.assertAlmostEqual(result["invested_total_estimate"], 25_000.0)
+
+
+class ActivityMetricsTest(unittest.TestCase):
+    def test_counts_all_assets_and_both_directions(self):
+        result = activity_metrics([
+            {"type": "Sale", "asset_type": "GS", "amount": "$15,001 - $50,000"},
+            {"type": "Purchase", "asset_type": "ST", "amount": "$1,001 - $15,000"},
+        ])
+        self.assertEqual(result["total_trades"], 2)
+        self.assertEqual(result["traded_total_estimate"], 40501.0)
+
+
+class CollectTransactionsTest(unittest.TestCase):
+    def test_unparseable_pdf_counts_as_failed(self):
+        rows = [{"Year": "2026", "DocID": "1", "Last": "Doe",
+                 "First": "Jane", "StateDst": "XX01"}]
+        with mock.patch.object(build_leaderboard, "fetch_ptr_text", return_value="not a PTR"):
+            by_member, parsed, failed = collect_transactions(rows, verbose=False)
+        self.assertEqual(dict(by_member), {})
+        self.assertEqual((parsed, failed), (0, 1))
+
+
+class LeaderboardOutputTest(unittest.TestCase):
+    def test_every_filer_is_emitted_and_non_equity_volume_is_preserved(self):
+        rows = [
+            {"Year": "2026", "DocID": "1", "FilingType": "P",
+             "Last": "Seller", "First": "Sam", "StateDst": "XX01"},
+            {"Year": "2026", "DocID": "2", "FilingType": "P",
+             "Last": "Empty", "First": "Eve", "StateDst": "XX02"},
+        ]
+        sale = {
+            "ticker": None, "asset": "Treasury", "asset_type": "GS",
+            "type": "Sale", "txn_date": "01/05/2026",
+            "amount": "$15,001 - $50,000",
+        }
+        parsed = {("seller", "XX01"): [sale]}
+        prices = price_book(SPY=series({"2026-01-05": 400.0}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "leaderboard.json"
+            argv = ["build_leaderboard.py"]
+            with mock.patch.object(build_leaderboard, "OUTPUT_PATH", output), \
+                    mock.patch.object(build_leaderboard, "fetch_index_years",
+                                      return_value=rows), \
+                    mock.patch.object(build_leaderboard, "collect_transactions",
+                                      return_value=(parsed, 1, 1)), \
+                    mock.patch.object(build_leaderboard, "PriceBook",
+                                      return_value=prices) as price_factory, \
+                    mock.patch.object(sys, "argv", argv):
+                build_leaderboard.main()
+
+            payload = json.loads(output.read_text())
+
+        members = {member["member"]: member for member in payload["members"]}
+        self.assertEqual(set(members), {"Sam Seller", "Eve Empty"})
+        self.assertEqual(members["Sam Seller"]["total_trades"], 1)
+        self.assertEqual(members["Sam Seller"]["traded_total_estimate"], 32500.5)
+        self.assertEqual(members["Eve Empty"]["total_trades"], 0)
+        self.assertEqual(payload["totals"]["ptr_failures"], 1)
+        self.assertGreater(
+            datetime.fromisoformat(price_factory.call_args.kwargs["end"]).date(),
+            datetime.now(timezone.utc).date(),
+        )
 
 
 if __name__ == "__main__":

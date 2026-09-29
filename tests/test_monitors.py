@@ -18,6 +18,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import congress_monitor  # noqa: E402
 from house_disclosures import (  # noqa: E402
     equity_transactions,
     filing_sort_key,
@@ -51,6 +52,7 @@ from monitor_common import (  # noqa: E402
 from watchlist_monitor import build_message, collapse_buys  # noqa: E402
 from daily_summary import (  # noqa: E402
     build_digest,
+    build_digest_batch,
     format_side,
     most_traded,
     select_members,
@@ -121,6 +123,32 @@ class AlertStateTest(unittest.TestCase):
     def test_missing_file_is_an_empty_state(self):
         state = load_alert_state(self.path)
         self.assertEqual((state.seen, state.pending, state.members), (set(), {}, set()))
+
+    def test_wrong_top_level_shape_is_quarantined(self):
+        self.path.write_text('"not an object"')
+        with self.assertRaises(SystemExit):
+            load_alert_state(self.path)
+        self.assertFalse(self.path.exists())
+        self.assertTrue(self.path.with_suffix(".json.corrupt").exists())
+
+    def test_wrong_nested_shape_is_quarantined(self):
+        self.path.write_text('{"seen": "not a list"}')
+        with self.assertRaises(SystemExit):
+            load_alert_state(self.path)
+        self.assertFalse(self.path.exists())
+        self.assertTrue(self.path.with_suffix(".json.corrupt").exists())
+
+
+class CongressDryRunTest(unittest.TestCase):
+    def test_first_dry_run_does_not_create_baseline_state(self):
+        rows = [{"DocID": "1", "FilingType": "P"}]
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "seen.json"
+            args = mock.Mock(dry_run=True, verbose=False)
+            with mock.patch.object(congress_monitor, "STATE_PATH", state_path), \
+                    mock.patch.object(congress_monitor, "fetch_index_years", return_value=rows):
+                congress_monitor.run(args)
+            self.assertFalse(state_path.exists())
 
 
 class RunLockTest(unittest.TestCase):
@@ -440,12 +468,16 @@ class SelectMembersTest(unittest.TestCase):
     # R1 returned less than R2 but beat the index; R2's 9% trailed a 12% index.
     LEADERBOARD = {"members": [
         {"member": "R1", "ranked": True, "return_pct_estimate": 5.0,
-         "alpha_pct_estimate": 3.0, "invested_total_estimate": 100.0},
+         "alpha_pct_estimate": 3.0, "invested_total_estimate": 100.0,
+         "traded_total_estimate": 100.0},
         {"member": "R2", "ranked": True, "return_pct_estimate": 9.0,
-         "alpha_pct_estimate": -3.0, "invested_total_estimate": 50.0},
+         "alpha_pct_estimate": -3.0, "invested_total_estimate": 50.0,
+         "traded_total_estimate": 50.0},
         {"member": "U1", "ranked": False, "return_pct_estimate": 99.0,
-         "alpha_pct_estimate": 90.0, "invested_total_estimate": 900.0},
-        {"member": "U2", "ranked": False, "invested_total_estimate": 0.0},
+         "alpha_pct_estimate": 90.0, "invested_total_estimate": 900.0,
+         "traded_total_estimate": 900.0},
+        {"member": "U2", "ranked": False, "return_pct_estimate": None,
+         "invested_total_estimate": 0.0, "traded_total_estimate": 1000.0},
     ]}
 
     def test_alpha_mode_ranks_beating_the_index_above_a_bigger_raw_return(self):
@@ -466,9 +498,9 @@ class SelectMembersTest(unittest.TestCase):
     def test_return_mode_caps_at_the_number_that_qualify(self):
         self.assertEqual(len(select_members(self.LEADERBOARD, 50, "return")), 2)
 
-    def test_volume_mode_includes_unranked_filers(self):
+    def test_volume_mode_includes_sell_only_filers(self):
         picked = select_members(self.LEADERBOARD, 50, "volume")
-        self.assertEqual([m["member"] for m in picked], ["U1", "R1", "R2"])
+        self.assertEqual([m["member"] for m in picked], ["U2", "U1", "R1", "R2"])
 
     def test_top_is_respected(self):
         self.assertEqual(len(select_members(self.LEADERBOARD, 1, "volume")), 1)
@@ -567,13 +599,13 @@ class BuildDigestTest(unittest.TestCase):
         msg = build_digest(self.NOW, [entry], "est. return", 25, 25)
         self.assertIn("could not be read from the PDF", msg)
 
-    def test_oversized_digest_is_truncated(self):
-        msg = build_digest(self.NOW, [self._entry()] * 400, "est. return", 50, 50)
-        self.assertTrue(msg.endswith("_(truncated)_"))
-
-    def test_truncated_digest_still_fits_the_message_budget(self):
-        """The marker must not push the digest into an extra Discord message."""
-        msg = build_digest(self.NOW, [self._entry()] * 400, "est. return", 50, 50)
+    def test_oversized_digest_defers_whole_filings(self):
+        msg, included = build_digest_batch(
+            self.NOW, [self._entry()] * 400, "est. return", 50, 50
+        )
+        self.assertGreater(included, 0)
+        self.assertLess(included, 400)
+        self.assertFalse(msg.endswith("_(truncated)_"))
         self.assertLessEqual(len(split_message(msg)), 3)
 
 

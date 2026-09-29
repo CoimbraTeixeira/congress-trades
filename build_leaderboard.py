@@ -194,8 +194,9 @@ class PriceBook:
         return len(self._closes)
 
 
-def collect_transactions(ptr_rows: list[dict], verbose: bool,
-                         use_cache: bool = True) -> tuple[dict[tuple, list[dict]], int]:
+def collect_transactions(
+    ptr_rows: list[dict], verbose: bool, use_cache: bool = True
+) -> tuple[dict[tuple, list[dict]], int, int]:
     """Fetch and parse every PTR, grouped by member. PDFs are fetched concurrently --
     serially this is a few thousand round-trips over a multi-year window and dominates
     the runtime; fetch_ptr_text's on-disk text cache removes it entirely on a re-run."""
@@ -204,7 +205,12 @@ def collect_transactions(ptr_rows: list[dict], verbose: bool,
     def fetch(row):
         try:
             text = fetch_ptr_text(row["Year"], row["DocID"], use_cache=use_cache)
-            return row, parse_transactions(text) if text else []
+            if not text:
+                raise ValueError("PDF unavailable or unreadable")
+            transactions = parse_transactions(text)
+            if not transactions:
+                raise ValueError("no transactions parsed")
+            return row, transactions
         except Exception as exc:
             return row, exc
 
@@ -226,7 +232,17 @@ def collect_transactions(ptr_rows: list[dict], verbose: bool,
 
     print(f"Parsed {parsed_count} transaction line(s) from {len(ptr_rows)} PTR(s)"
           f"{f', {failed} failed' if failed else ''}.", file=sys.stderr)
-    return by_member, parsed_count
+    return by_member, parsed_count, failed
+
+
+def activity_metrics(txns: list[dict]) -> dict:
+    """In-window buy/sell activity across every asset, priced or not."""
+    return {
+        "total_trades": len(txns),
+        "traded_total_estimate": round(
+            sum(amount_midpoint(t.get("amount", "")) or 0.0 for t in txns), 2
+        ),
+    }
 
 
 def benchmark_gain(prices: PriceBook, cost: float,
@@ -390,13 +406,13 @@ def main() -> None:
             "last": r.get("Last", "").strip(),
             "state_dist": r.get("StateDst", "?"),
         })
-    by_member, parsed_lines = collect_transactions(ptr_rows, args.verbose,
-                                                   use_cache=not args.no_cache)
+    by_member, parsed_lines, failed_ptrs = collect_transactions(
+        ptr_rows, args.verbose, use_cache=not args.no_cache
+    )
 
-    # Resolve tickers once across all members so the name-lookup cache is shared. Only
-    # in-window buys and sells get here: the archives are fetched by filing year and
-    # reach further back than the window they are read for, and a row that is neither a
-    # purchase nor a sale (an Exchange) has no direction to score.
+    # Activity includes every in-window buy and sell, including non-equities and rows
+    # without a resolvable ticker. Gain scoring remains limited to tickered instruments.
+    activity: dict[tuple, list[dict]] = defaultdict(list)
     tradeable: dict[tuple, list[dict]] = defaultdict(list)
     tickers: set[str] = set()
     non_trade_lines = out_of_window_lines = 0
@@ -407,13 +423,14 @@ def main() -> None:
             if not in_performance_window(t, window_start, window_end):
                 out_of_window_lines += 1
                 continue
+            activity[key].append(t)
             t["ticker"] = resolve_ticker(t)
             if t["ticker"]:
                 tickers.add(t["ticker"])
                 tradeable[key].append(t)
-    print(f"{sum(len(v) for v in tradeable.values())} in-window Purchase/Sale line(s) "
-          f"across {len(tickers)} ticker(s); {out_of_window_lines} trade line(s) fell "
-          f"outside the window and {non_trade_lines} were not buys or sells.",
+    print(f"{sum(len(v) for v in tradeable.values())} tickered in-window Purchase/Sale "
+          f"line(s) across {len(tickers)} ticker(s); {out_of_window_lines} trade line(s) "
+          f"fell outside the window and {non_trade_lines} were not buys or sells.",
           file=sys.stderr)
 
     # The price series opens at the window's start, or later if every trade in it is --
@@ -422,7 +439,7 @@ def main() -> None:
     all_txns = [t for txns in tradeable.values() for t in txns]
     start = price_window_start(all_txns, window_start)
     prices = PriceBook(tickers | {BENCHMARK_TICKER}, start=start,
-                       end=(now.date().isoformat()))
+                       end=(now.date() + timedelta(days=1)).isoformat())
     priced = sum(1 for t in tickers if t in prices)
     print(f"Priced {priced}/{len(tickers)} ticker(s) from {start}.", file=sys.stderr)
     if BENCHMARK_TICKER not in prices:
@@ -430,17 +447,18 @@ def main() -> None:
               f"benchmark comparison", file=sys.stderr)
 
     leaderboard = []
-    for key, txns in tradeable.items():
+    for key, member in meta.items():
         entry = {
-            "member": meta[key]["name"],
+            "member": member["name"],
             # Identity the monitors match index rows against; the name fields beside it
             # are for display and are whatever the newest archive spells them.
             "member_key": list(key),
-            "first": meta[key]["first"],
-            "last": meta[key]["last"],
-            "state_dist": meta[key]["state_dist"],
+            "first": member["first"],
+            "last": member["last"],
+            "state_dist": member["state_dist"],
         }
-        entry.update(score_member(txns, prices))
+        entry.update(score_member(tradeable.get(key, []), prices))
+        entry.update(activity_metrics(activity.get(key, [])))
         entry["ranked"] = (
             entry["return_pct_estimate"] is not None
             and entry["invested_total_estimate"] >= args.min_invested
@@ -451,10 +469,15 @@ def main() -> None:
     # Ordered by alpha where there is one: a raw return ranks a bull-market beta holder
     # above a genuine stock picker. Members with no benchmarked lot fall back to the raw
     # return rather than dropping out of the file.
+    def rank_value(member: dict) -> float:
+        alpha = member["alpha_pct_estimate"]
+        raw_return = member["return_pct_estimate"]
+        return alpha if alpha is not None else (
+            raw_return if raw_return is not None else -1e9
+        )
+
     leaderboard.sort(
-        key=lambda m: (m["ranked"],
-                       m["alpha_pct_estimate"] if m["alpha_pct_estimate"] is not None
-                       else (m["return_pct_estimate"] or -1e9)),
+        key=lambda m: (m["ranked"], rank_value(m)),
         reverse=True,
     )
 
@@ -468,24 +491,27 @@ def main() -> None:
         "min_trades": args.min_trades,
         "totals": {
             "ptr_count": len(ptr_rows),
+            "ptr_failures": failed_ptrs,
             "transaction_lines": parsed_lines,
             "tradeable_lines": sum(len(v) for v in tradeable.values()),
             "out_of_window_lines": out_of_window_lines,
             "non_trade_lines": non_trade_lines,
             "tickers": len(tickers),
-            "tickers_priced": len(prices),
+            "tickers_priced": priced,
         },
         "benchmark_ticker": BENCHMARK_TICKER,
         "price_window_start": start,
         "methodology": (
             f"Scope is every Purchase/Sale disclosed with a transaction date in the "
             f"{args.window_years}-year window ending {window_end.date().isoformat()}, "
-            "read from each filing-year archive that can contain one. Estimated shares = "
-            "disclosed range midpoint / close on the transaction date; buys and sells "
-            "FIFO-matched in share space for realized gains; unsold shares marked to the "
-            "latest close. Unmatched sales (positions opened before the window) and "
-            "non-equity assets are excluded from gain estimates but counted as trades. "
-            "Members below min_invested/min_trades are unranked. "
+            "read from each filing-year archive that can contain one. Estimated traded "
+            "volume is the sum of disclosed range midpoints across all in-window buys and "
+            "sells. Estimated shares = disclosed range midpoint / close on the transaction "
+            "date; tickered buys and sells are FIFO-matched in share space for realized "
+            "gains; unsold shares are marked to the latest close. Unmatched sales "
+            "(positions opened before the window) and non-equity assets are excluded from "
+            "gain estimates but counted as trades. Members below min_invested/min_trades "
+            "are unranked. "
             f"alpha_pct_estimate is the return less what {BENCHMARK_TICKER} returned over "
             "the same holding windows, dollar-weighted the same way."
         ),

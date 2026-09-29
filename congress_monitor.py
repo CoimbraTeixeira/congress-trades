@@ -128,9 +128,13 @@ def run(args) -> None:
 
     if not STATE_PATH.exists():
         # Baseline run: record everything that already exists without alerting on the
-        # historical backlog. Only filings that show up in future runs are new.
-        seed_baseline(STATE_PATH, {r["DocID"] for r in ptr_rows},
-                      f"PTR(s) for {', '.join(str(y) for y in years)}")
+        # historical backlog. A dry run reports the action but never mutates state.
+        doc_ids = {r["DocID"] for r in ptr_rows}
+        label = f"PTR(s) for {', '.join(str(y) for y in years)}"
+        if args.dry_run:
+            log(f"Dry run: would seed baseline with {len(doc_ids)} existing {label}.")
+        else:
+            seed_baseline(STATE_PATH, doc_ids, label)
         return
 
     state = load_alert_state(STATE_PATH)

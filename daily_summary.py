@@ -82,10 +82,8 @@ def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
     `alpha` ranks by estimated return less what the benchmark did over the same holding
     windows -- the default, because a raw return in a rising market ranks whoever held
     the most beta above whoever picked well. `return` ranks by the raw figure. Both are
-    only defined for members who clear the leaderboard's thresholds, and there are
-    usually far fewer of those than the requested top-N, because most members are
-    sell-only in a given year and so have no computable return at all. `volume` ranks by
-    dollars traded, which every filer has.
+    only defined for members who clear the leaderboard's thresholds. `volume` ranks
+    every filer by all in-window buys and sells, including non-equity assets.
     """
     members = leaderboard["members"]
     if rank_by == "alpha":
@@ -96,8 +94,8 @@ def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
         pool = [m for m in members if m.get("ranked")]
         key = lambda m: m["return_pct_estimate"]  # noqa: E731
     else:
-        pool = [m for m in members if m.get("invested_total_estimate")]
-        key = lambda m: m["invested_total_estimate"]  # noqa: E731
+        pool = members
+        key = lambda m: m["traded_total_estimate"]  # noqa: E731
     return sorted(pool, key=key, reverse=True)[:top]
 
 
@@ -169,16 +167,16 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
         if alpha is not None:
             ret_label += f" ({alpha:+.1f}% vs index)"
         lines += ["", f"**{escape_markdown(member['member'])}** · "
-                      f"{member['state_dist']} · #{member['rank']}{ret_label}"]
+                      f"{member['state_dist']} · #{member['rank']}{ret_label}",
+                  entry["pdf_link"]]
         if summary["buys"]:
             lines.append(f"🟢 **BOUGHT** {format_side(summary['buys'])}")
         if summary["sells"]:
             lines.append(f"🔴 **SOLD** {format_side(summary['sells'])}")
         if not summary["buys"] and not summary["sells"]:
             lines.append("_(transactions could not be read from the PDF)_")
-        lines.append(entry["pdf_link"])
 
-    return truncate_to_messages("\n".join(lines))
+    return "\n".join(lines)
 
 
 def truncate_to_messages(text: str) -> str:
@@ -193,6 +191,44 @@ def truncate_to_messages(text: str) -> str:
     kept = "\n".join(chunks[:MAX_DIGEST_MESSAGES])
     budget = max(len(kept) - len(TRUNCATION_MARKER), 0)
     return kept[:budget].rsplit("\n", 1)[0] + TRUNCATION_MARKER
+
+
+def build_digest_batch(now: datetime, entries: list[dict], scope_label: str,
+                       covered: int, requested: int, index=None) -> tuple[str, int]:
+    """Build the largest oldest-first batch that fits the Discord post budget.
+
+    The count tells the caller exactly which reportable filings may be marked seen.
+    Overflow remains unseen for the next digest instead of disappearing behind a
+    truncation marker.
+    """
+    if not entries:
+        return build_digest(now, entries, scope_label, covered, requested, index), 0
+
+    low, high = 1, len(entries)
+    best_count = 0
+    best_message = ""
+    while low <= high:
+        count = (low + high) // 2
+        candidate = build_digest(
+            now, entries[:count], scope_label, covered, requested, index
+        )
+        if len(split_message(candidate)) <= MAX_DIGEST_MESSAGES:
+            best_count, best_message = count, candidate
+            low = count + 1
+        else:
+            high = count - 1
+
+    if best_count:
+        return best_message, best_count
+
+    # A pathological single filing can still carry very long third-party text. Its PDF
+    # link is placed before details, so this fallback still identifies what was handled.
+    return (
+        truncate_to_messages(
+            build_digest(now, entries[:1], scope_label, covered, requested, index)
+        ),
+        1,
+    )
 
 
 def most_traded(entries: list[dict], filer_count: int) -> list[str]:
@@ -389,13 +425,17 @@ def run(args) -> None:
         log(f"Holding {len(deferred)} filing(s) whose PDF has not published yet for a "
             f"later digest.")
     entries = [e for e in entries if e["doc_id"] not in deferred]
-    handled = [r["DocID"] for r in new_rows if r["DocID"] not in deferred]
+    reportable_ids = {e["doc_id"] for e in entries}
+    silent_handled = {
+        r["DocID"] for r in new_rows
+        if r["DocID"] not in deferred and r["DocID"] not in reportable_ids
+    }
     if not entries and not args.post_empty:
         log(f"{plural(len(new_rows), 'new filing')} from the top {len(top_members)}, "
             f"none with reportable stock transactions; nothing to summarise.")
         if not args.dry_run:
             # Still handled -- leaving them unseen would re-fetch every PDF tomorrow.
-            state.seen |= set(handled)
+            state.seen |= silent_handled
             save_alert_state(STATE_PATH, state)
         return
 
@@ -403,18 +443,22 @@ def run(args) -> None:
         args.rank_by, "dollars traded")
     # Optional: the digest is a report, not a search tool, so a missing or unbuilt index
     # costs it the theme lines and nothing else.
-    message = build_digest(now, entries, scope_label, len(top_members), args.top,
-                           ThemeIndex())
+    message, included_count = build_digest_batch(
+        now, entries, scope_label, len(top_members), args.top, ThemeIndex()
+    )
+    included_entries = entries[:included_count]
+    included_ids = {e["doc_id"] for e in included_entries}
+    size_deferred = len(entries) - included_count
     if args.verbose or args.dry_run:
         print(message)
 
-    # Count the filings the digest actually reports on, not everything read: with the
-    # stock filter on, those differ, and the digest's own header states the former.
-    filtered = len(new_rows) - len(entries)
+    filtered = len(silent_handled)
     tail = f" ({filtered} with no stock transactions)" if filtered else ""
+    size_tail = f" {size_deferred} deferred by the message limit." if size_deferred else ""
 
     if args.dry_run:
-        log(f"Would post a digest covering {plural(len(entries), 'new filing')}{tail}.")
+        log(f"Would post a digest covering "
+            f"{plural(included_count, 'new filing')}{tail}.{size_tail}")
         return
 
     try:
@@ -423,10 +467,10 @@ def run(args) -> None:
         # Leave every DocID unseen so the next run retries rather than losing the day.
         sys.exit(f"Failed to post the digest: {exc}")
 
-    state.seen |= set(handled)
+    state.seen |= silent_handled | included_ids
     save_alert_state(STATE_PATH, state)
-    log(f"Posted a digest covering {plural(len(entries), 'new filing')}{tail} from the "
-        f"top {len(top_members)}.")
+    log(f"Posted a digest covering {plural(included_count, 'new filing')}{tail} from the "
+        f"top {len(top_members)}.{size_tail}")
 
 
 if __name__ == "__main__":
