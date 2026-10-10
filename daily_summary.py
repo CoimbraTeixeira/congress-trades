@@ -33,6 +33,7 @@ from house_disclosures import (
     index_years,
     member_key,
     parse_transactions,
+    scanned_page_count,
     trade_transactions,
 )
 from monitor_common import (
@@ -51,6 +52,7 @@ from monitor_common import (
     plural,
     run_lock,
     save_alert_state,
+    scanned_note,
     send_discord_message,
     shorten,
     split_message,
@@ -174,7 +176,9 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
         if summary["sells"]:
             lines.append(f"🔴 **SOLD** {format_side(summary['sells'])}")
         if not summary["buys"] and not summary["sells"]:
-            lines.append("_(transactions could not be read from the PDF)_")
+            lines.append(f"_({scanned_note(entry['scanned_pages'])})_"
+                         if entry.get("scanned_pages")
+                         else "_(transactions could not be read from the PDF)_")
 
     return "\n".join(lines)
 
@@ -381,12 +385,14 @@ def run(args) -> None:
         return
 
     def load(row: dict) -> dict:
+        pdf_text = None
         try:
             pdf_text = fetch_ptr_text(row["Year"], row["DocID"])
             transactions = parse_transactions(pdf_text) if pdf_text else []
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {row['DocID']}: {exc}", file=sys.stderr)
             transactions = []
+        scanned_pages = scanned_page_count(pdf_text)
         # Buys and sells only, and stocks only unless --all-assets: an Exchange is a
         # share-class swap or a merger conversion, so it has no direction to report and
         # a filing holding nothing else drops out here rather than reaching the digest
@@ -399,8 +405,10 @@ def run(args) -> None:
             "pdf_link": PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
             # Whether the PDF read at all, kept separate from whether it held any stock
             # trades -- the digest prints "could not be read" off the first, and dropping
-            # a bond-only filing must not borrow that line.
-            "unreadable": not transactions,
+            # a bond-only filing must not borrow that line. A scan is neither: it is
+            # complete and published, and is listed with a link at once.
+            "unreadable": not transactions and not scanned_pages,
+            "scanned_pages": scanned_pages,
             "txn_count": len(reported),
             "summary": summarise_filing(reported),
         }
@@ -408,7 +416,8 @@ def run(args) -> None:
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
         all_entries = list(pool.map(load, new_rows))
 
-    entries = [e for e in all_entries if e["txn_count"] or e["unreadable"]]
+    entries = [e for e in all_entries
+               if e["txn_count"] or e["unreadable"] or e["scanned_pages"]]
     # A filing whose PDF has not published yet is held over instead of being reported as
     # unreadable: the Clerk indexes a row before the document is reachable, and tomorrow's
     # digest will have the real contents. Only after the grace period does it go in as

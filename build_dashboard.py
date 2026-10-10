@@ -207,6 +207,22 @@ const fmtMoney = v => (v < 0 ? '-$' : '$') + Math.round(Math.abs(v)).toLocaleStr
 const fmtSigned = v => (v >= 0 ? '+' : '-') + '$' + Math.round(Math.abs(v)).toLocaleString();
 const fmtPct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
 
+// Members who file on paper submit scans with no text layer, so their trades are in none
+// of the figures. Named rather than counted: the heaviest paper filers are among the most
+// active traders in the House, and their absence from the table would otherwise read as
+// inactivity.
+function scannedNote() {
+  const scanned = MEMBERS.filter(m => m.scanned_filings > 0)
+    .sort((a, b) => b.scanned_filings - a.scanned_filings);
+  if (!scanned.length) return '';
+  const names = scanned.slice(0, 8)
+    .map(m => `${esc(m.member)} (${esc(m.scanned_filings)})`).join(', ');
+  const more = scanned.length > 8 ? `, and ${scanned.length - 8} more` : '';
+  return `<li><strong>${esc(TOTALS.scanned_ptrs ?? 0)} filings are scanned paper forms</strong>
+      with no machine-readable text, so their trades are missing from every figure here.
+      Members affected, with scanned filings: ${names}${more}.</li>`;
+}
+
 function renderHeader() {
   const span = DATA.window_start && DATA.window_end
     ? `trades ${DATA.window_start} to ${DATA.window_end}`
@@ -241,6 +257,7 @@ function renderHeader() {
           tops the board. Unranked members are shown greyed in the table.</li>
       <li>Members can file up to 45 days after a trade — recent trades may not appear yet.
           House only; Senate disclosures aren't included.</li>
+      ${scannedNote()}
     </ul>`;
 
   const withAlpha = RANKED.filter(m => m.alpha_pct_estimate !== null &&
@@ -353,7 +370,7 @@ function renderTable() {
     (b.ranked - a.ranked) || compare(a, b, sortKey) * sortDir);
   document.getElementById('full-table-body').innerHTML = rows.map(m => `
     <tr class="${m.ranked ? '' : 'unranked'}">
-      <td>${esc(m.member)}${m.ranked ? '' : ' <span class="dist">(unranked)</span>'}</td>
+      <td>${esc(m.member)}${m.ranked ? '' : ' <span class="dist">(unranked)</span>'}${m.scanned_filings > 0 ? ` <span class="dist">(+${esc(m.scanned_filings)} scanned, not counted)</span>` : ''}</td>
       <td>${esc(m.state_dist)}</td>
       <td class="num">${esc(m.priced_trades)}</td>
       <td class="num">${esc(fmtMoney(m.invested_total_estimate))}</td>

@@ -35,7 +35,7 @@ import argparse
 import json
 import logging
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,6 +56,7 @@ from house_disclosures import (
     performance_index_years,
     performance_window_start,
     resolve_ticker,
+    scanned_page_count,
     trade_transactions,
 )
 
@@ -196,15 +197,23 @@ class PriceBook:
 
 def collect_transactions(
     ptr_rows: list[dict], verbose: bool, use_cache: bool = True
-) -> tuple[dict[tuple, list[dict]], int, int]:
+) -> tuple[dict[tuple, list[dict]], int, int, Counter]:
     """Fetch and parse every PTR, grouped by member. PDFs are fetched concurrently --
     serially this is a few thousand round-trips over a multi-year window and dominates
-    the runtime; fetch_ptr_text's on-disk text cache removes it entirely on a re-run."""
+    the runtime; fetch_ptr_text's on-disk text cache removes it entirely on a re-run.
+
+    Returns the transactions by member, the parsed line count, the failed-PTR count and
+    the scanned paper filings per member. Scans are counted apart from failures: they
+    are not broken, they are images, and a member who files on paper has a record the
+    leaderboard cannot see rather than an empty one."""
     by_member: dict[tuple, list[dict]] = defaultdict(list)
+    scanned_by_member: Counter = Counter()
 
     def fetch(row):
         try:
             text = fetch_ptr_text(row["Year"], row["DocID"], use_cache=use_cache)
+            if scanned_page_count(text):
+                return row, None
             if not text:
                 raise ValueError("PDF unavailable or unreadable")
             transactions = parse_transactions(text)
@@ -217,6 +226,9 @@ def collect_transactions(
     parsed_count = failed = 0
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
         for i, (row, result) in enumerate(pool.map(fetch, ptr_rows)):
+            if result is None:
+                scanned_by_member[member_key(row)] += 1
+                continue
             if isinstance(result, Exception):
                 failed += 1
                 if verbose:
@@ -230,9 +242,12 @@ def collect_transactions(
             if verbose and (i + 1) % 50 == 0:
                 print(f"  processed {i+1}/{len(ptr_rows)} PTRs...", file=sys.stderr)
 
+    scanned = sum(scanned_by_member.values())
+    scanned_note = (f", {scanned} scanned paper filing(s) from {len(scanned_by_member)} "
+                    f"member(s) unreadable" if scanned else "")
     print(f"Parsed {parsed_count} transaction line(s) from {len(ptr_rows)} PTR(s)"
-          f"{f', {failed} failed' if failed else ''}.", file=sys.stderr)
-    return by_member, parsed_count, failed
+          f"{f', {failed} failed' if failed else ''}{scanned_note}.", file=sys.stderr)
+    return by_member, parsed_count, failed, scanned_by_member
 
 
 def activity_metrics(txns: list[dict]) -> dict:
@@ -406,7 +421,7 @@ def main() -> None:
             "last": r.get("Last", "").strip(),
             "state_dist": r.get("StateDst", "?"),
         })
-    by_member, parsed_lines, failed_ptrs = collect_transactions(
+    by_member, parsed_lines, failed_ptrs, scanned_by_member = collect_transactions(
         ptr_rows, args.verbose, use_cache=not args.no_cache
     )
 
@@ -459,6 +474,9 @@ def main() -> None:
         }
         entry.update(score_member(tradeable.get(key, []), prices))
         entry.update(activity_metrics(activity.get(key, [])))
+        # Filings that exist but are scans: their trades are in none of the figures above,
+        # so a member with any is under-counted, and one with only scans is not "inactive".
+        entry["scanned_filings"] = scanned_by_member.get(key, 0)
         entry["ranked"] = (
             entry["return_pct_estimate"] is not None
             and entry["invested_total_estimate"] >= args.min_invested
@@ -492,6 +510,7 @@ def main() -> None:
         "totals": {
             "ptr_count": len(ptr_rows),
             "ptr_failures": failed_ptrs,
+            "scanned_ptrs": sum(scanned_by_member.values()),
             "transaction_lines": parsed_lines,
             "tradeable_lines": sum(len(v) for v in tradeable.values()),
             "out_of_window_lines": out_of_window_lines,

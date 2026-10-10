@@ -21,6 +21,7 @@ from house_disclosures import (
     index_years,
     member_key,
     parse_transactions,
+    scanned_page_count,
 )
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
@@ -42,6 +43,7 @@ from monitor_common import (
     plural,
     run_lock,
     save_alert_state,
+    scanned_note,
     send_discord_message,
 )
 from search_common import THEME_SIMILARITY, ThemeIndex
@@ -158,6 +160,20 @@ def build_landed_message(member: dict, row: dict, watchlist_size: int) -> str:
     ])
 
 
+def build_scanned_message(member: dict, row: dict, pages: int, watchlist_size: int) -> str:
+    """A watched member filed on paper. The scan may hold a buy, and this monitor exists
+    for speed on exactly that, so it is said on the first sighting rather than after a
+    grace period spent waiting for text a scan will never have."""
+    return "\n".join([
+        f"🚨 **{escape_markdown(member['member'])}** ({member['state_dist']}) — "
+        f"watchlist filing",
+        f"#{member['rank']} of {watchlist_size} on the watchlist",
+        f"Filed {row.get('FilingDate', '?')} · {scanned_note(pages)}; it may or may not "
+        f"contain a buy",
+        PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
+    ])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
@@ -246,16 +262,28 @@ def run(args) -> None:
     # Built once per run, not per alert: it reads the whole ticker collection, and the
     # vectors it needs are already in the store, so no embedding model is loaded here.
     index = ThemeIndex()
-    sent = announced = waiting = 0
+    sent = announced = waiting = scanned = 0
     for row in new_rows:
         doc_id = row["DocID"]
         member = watched_by_key[member_key(row)]
+        pdf_text = None
         try:
             pdf_text = fetch_ptr_text(row["Year"], doc_id)
             transactions = parse_transactions(pdf_text) if pdf_text else []
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
+
+        pages = scanned_page_count(pdf_text)
+        if pages:
+            message = build_scanned_message(member, row, pages, len(watched_by_key))
+            if not deliver(message, doc_id, webhook_url, args):
+                continue
+            scanned += 1
+            state.pending.pop(doc_id, None)
+            state.seen.add(doc_id)
+            persist()
+            continue
 
         # A filing we couldn't read is not a filing without purchases, and staying silent
         # on it is indistinguishable from "nothing happened". But an unpublished PDF is
@@ -302,6 +330,7 @@ def run(args) -> None:
     log(f"{verb} {sent} buy alert(s) out of {len(new_rows)} new watchlist filing(s)."
         + (f" {announced} filing(s) announced ahead of their PDF." if announced else "")
         + (f" {waiting} still awaiting a PDF." if waiting else "")
+        + (f" {scanned} scanned paper filing(s) linked without contents." if scanned else "")
         + (f" {backlog} deferred." if backlog else ""))
 
 

@@ -309,6 +309,15 @@ def plural(count: int, noun: str, suffix: str = "s") -> str:
     return f"{count} {noun}{'' if count == 1 else suffix}"
 
 
+def scanned_note(pages: int) -> str:
+    """What a reader of any alert is told about a scanned paper filing.
+
+    It must not read as an error ("could not be read") or a delay ("not published
+    yet"): the PDF is there and complete, it is just a picture of a paper form."""
+    return (f"filed on paper — a {pages}-page scan with no machine-readable text; "
+            f"open the PDF for the trades")
+
+
 def display_name(member: dict) -> str:
     """'McCormick, Richard' from a leaderboard/watchlist member's identity fields.
 

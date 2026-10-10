@@ -154,10 +154,36 @@ member with 403 priced trades.
 
 Four archives is ~1,800 PTRs per rebuild rather than ~390 (8 MB of text), so extracted
 PDF text is cached under `cache/ptr_text/<year>/<DocID>.txt` (gitignored). A filing never
-changes, so a warm rebuild re-downloads nothing but prices. Only a successful, non-empty
-extraction is cached: caching a 404 — the Clerk publishes index rows slightly ahead of
-some PDFs — or an unreadable PDF would turn a transient failure into a permanent one.
-`--no-cache` forces the re-fetch.
+changes, so a warm rebuild re-downloads nothing but prices. A 404 — the Clerk publishes
+index rows slightly ahead of some PDFs — or a failed extraction is never cached, since
+that would turn a transient failure into a permanent one. A scanned paper filing *is*
+cached (see *Paper filings* below): a scan never gains a text layer, so re-downloading
+it every run would buy nothing. `--no-cache` forces the re-fetch.
+
+## Paper filings
+
+About **one PTR in seven is a scan of a paper form**: every DocID starting `8` or `9`,
+247 of the 1,844 filings in the current window, from 28 members. The PDF is complete and
+published, but it is an image per page with no text layer, so `pdftotext` emits nothing
+but page breaks and no parser can see the trades. OCR is not a fix: the forms are
+checkbox grids, often reading "see attached" over dozens of pages of broker statements.
+
+These used to be misreported twice. The monitors announced them as *"contents not
+published yet"*, retried hourly for a day, then alerted *"transactions could not be
+read"* — a day late, and described as a fault. The leaderboard counted them in
+`ptr_failures`, which hid that several of the House's busiest traders are missing
+entirely: Ro Khanna (45 scanned filings), Hal Rogers (43) and Michael McCaul (42) file
+almost only on paper and show zero trades.
+
+Now `scanned_page_count()` recognises a scan from its text (page breaks only), and:
+
+- all three alerts link it **at once** as *"filed on paper — a 31-page scan with no
+  machine-readable text; open the PDF for the trades"*, mark it handled, and never put
+  it in the publish-gap wait;
+- `leaderboard.json` carries `scanned_filings` per member and `totals.scanned_ptrs`,
+  separate from `ptr_failures`;
+- the dashboard names the affected members in its notes and marks each table row that
+  has scans as `(+N scanned, not counted)`.
 
 ## Semantic search
 
@@ -294,7 +320,8 @@ silently costing alerts, and what they do now:
   `--all-assets` turns it off.
 - A PTR whose **PDF won't fetch or parse** used to yield zero purchases, which is
   indistinguishable from a filing with no purchases in it. It now announces the filing
-  and alerts the contents when the PDF publishes — see below.
+  and alerts the contents when the PDF publishes — see below. A **scanned paper filing**
+  is linked immediately instead — see *Paper filings* above.
 - `--max-alerts` truncation now keeps the **oldest** filings; the archive's row order
   isn't chronological, so it previously kept an arbitrary slice.
 
@@ -328,7 +355,8 @@ Two things had to change for hourly polling to be safe:
 The waiting set lives in the state file beside the seen-set (`{"seen": [...],
 "pending": {"<DocID>": "<first sighted>"}}`), which also reads the old bare-list and
 pending-less formats, so upgrading does not replay a back catalogue. `daily_summary.py`
-holds an unpublished filing over to the next digest for the same reason.
+holds an unpublished filing over to the next digest for the same reason. None of this
+applies to a scanned paper filing, which is published and complete on first sighting.
 
 ## Schedule
 
@@ -374,9 +402,10 @@ a page break.
 silently not alerted (wrong index year, baselined on promotion, read as "no purchases"
 when it was really unreadable) — plus what hourly polling added: the publish-gap state
 machine (announce once, wait silently, give up after the grace period, and resolve a
-corrupt or naive timestamp rather than retrying forever), strict state shape validation
-with both legacy formats, dry-run immutability, digest overflow deferral, and the run lock
-releasing on both a clean exit and a crash.
+corrupt or naive timestamp rather than retrying forever), scanned paper filings linked
+at once rather than entering that wait, strict state shape validation with both legacy
+formats, dry-run immutability, digest overflow deferral, and the run lock releasing on
+both a clean exit and a crash.
 
 `tests/test_leaderboard.py` covers the scoring and accounting engine: the FIFO matcher,
 price lookup boundaries, benchmark comparison, all-asset traded volume, failed-PTR
@@ -430,7 +459,8 @@ amount or a share count.
   name lookup will cheerfully match "US Treasury Note" to some unrelated equity.
 - Every PTR filer appears in `leaderboard.json`, including members with no parsed or
   priceable trades. `totals.ptr_failures` exposes PDFs that could not be fetched or
-  parsed rather than making a partial build look complete.
+  parsed rather than making a partial build look complete; `totals.scanned_ptrs` and each
+  member's `scanned_filings` count the scanned paper filings no figure includes.
 - Members are **ranked** only above `--min-invested` / `--min-trades` thresholds;
   otherwise a single lucky $15k trade tops the board. Both count across the whole
   window, so three years of trading clears them more easily than one year did.

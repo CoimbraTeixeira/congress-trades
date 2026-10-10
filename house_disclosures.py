@@ -319,9 +319,11 @@ def _write_cached_text(path: Path, text: str) -> None:
 def fetch_ptr_text(year: int | str, doc_id: str, use_cache: bool = True) -> str | None:
     """The filing's PDF as `pdftotext -layout` text, cached on disk by DocID.
 
-    Only a successful, non-empty extraction is cached: a 404 (the Clerk publishes index
-    rows slightly ahead of some PDFs), a fetch error or an unreadable PDF must be
-    retried on the next run, and caching "" would make a transient failure permanent.
+    A 404 (the Clerk publishes index rows slightly ahead of some PDFs), a fetch error or
+    a failed extraction returns None and is never cached, so it is retried next run --
+    caching it would make a transient failure permanent. A scanned paper filing *is*
+    cached: its text is only page breaks (see scanned_page_count), and a scan never
+    gains a text layer, so re-downloading it every run would buy nothing.
     """
     if shutil.which("pdftotext") is None:
         sys.exit("pdftotext not found -- install poppler-utils (apt install poppler-utils)")
@@ -348,6 +350,20 @@ def fetch_ptr_text(year: int | str, doc_id: str, use_cache: bool = True) -> str 
     if cache_path is not None and result.stdout:
         _write_cached_text(cache_path, result.stdout)
     return result.stdout
+
+
+def scanned_page_count(pdf_text: str | None) -> int:
+    """Page count of a PTR filed on paper and scanned, or 0 if it was not.
+
+    About one PTR in seven -- every DocID starting 8 or 9 -- is a scan: an image per
+    page with no text layer, so pdftotext succeeds and emits nothing but one form feed
+    per page. That is a permanent property of the document, not the publish gap a
+    missing PDF is, so callers must say so at once rather than wait for contents that
+    will never appear. Missing text (None or "") is the publish gap and returns 0.
+    """
+    if not pdf_text or pdf_text.strip():
+        return 0
+    return max(pdf_text.count("\f"), 1)
 
 
 def _is_page_furniture(line: str) -> bool:

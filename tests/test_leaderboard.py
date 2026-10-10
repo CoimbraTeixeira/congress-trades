@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -343,13 +344,22 @@ class ActivityMetricsTest(unittest.TestCase):
 
 
 class CollectTransactionsTest(unittest.TestCase):
+    ROWS = [{"Year": "2026", "DocID": "1", "Last": "Doe",
+             "First": "Jane", "StateDst": "XX01"}]
+
     def test_unparseable_pdf_counts_as_failed(self):
-        rows = [{"Year": "2026", "DocID": "1", "Last": "Doe",
-                 "First": "Jane", "StateDst": "XX01"}]
         with mock.patch.object(build_leaderboard, "fetch_ptr_text", return_value="not a PTR"):
-            by_member, parsed, failed = collect_transactions(rows, verbose=False)
+            by_member, parsed, failed, scanned = collect_transactions(self.ROWS, verbose=False)
         self.assertEqual(dict(by_member), {})
-        self.assertEqual((parsed, failed), (0, 1))
+        self.assertEqual((parsed, failed, sum(scanned.values())), (0, 1, 0))
+
+    def test_scanned_paper_filing_is_counted_per_member_not_as_a_failure(self):
+        # A scan is a complete filing the parser cannot see; calling it a failure hid
+        # that whole members (paper filers) were missing rather than partly misparsed.
+        with mock.patch.object(build_leaderboard, "fetch_ptr_text", return_value="\f" * 4):
+            by_member, parsed, failed, scanned = collect_transactions(self.ROWS, verbose=False)
+        self.assertEqual((dict(by_member), parsed, failed), ({}, 0, 0))
+        self.assertEqual(dict(scanned), {("doe", "XX01"): 1})
 
 
 class LeaderboardOutputTest(unittest.TestCase):
@@ -375,7 +385,8 @@ class LeaderboardOutputTest(unittest.TestCase):
                     mock.patch.object(build_leaderboard, "fetch_index_years",
                                       return_value=rows), \
                     mock.patch.object(build_leaderboard, "collect_transactions",
-                                      return_value=(parsed, 1, 1)), \
+                                      return_value=(parsed, 1, 1,
+                                                    Counter({("empty", "XX02"): 3}))), \
                     mock.patch.object(build_leaderboard, "PriceBook",
                                       return_value=prices) as price_factory, \
                     mock.patch.object(sys, "argv", argv):
@@ -388,7 +399,10 @@ class LeaderboardOutputTest(unittest.TestCase):
         self.assertEqual(members["Sam Seller"]["total_trades"], 1)
         self.assertEqual(members["Sam Seller"]["traded_total_estimate"], 32500.5)
         self.assertEqual(members["Eve Empty"]["total_trades"], 0)
+        self.assertEqual(members["Eve Empty"]["scanned_filings"], 3)
+        self.assertEqual(members["Sam Seller"]["scanned_filings"], 0)
         self.assertEqual(payload["totals"]["ptr_failures"], 1)
+        self.assertEqual(payload["totals"]["scanned_ptrs"], 3)
         self.assertGreater(
             datetime.fromisoformat(price_factory.call_args.kwargs["end"]).date(),
             datetime.now(timezone.utc).date(),

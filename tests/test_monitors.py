@@ -24,6 +24,7 @@ from house_disclosures import (  # noqa: E402
     filing_sort_key,
     index_years,
     is_equity_transaction,
+    scanned_page_count,
 )
 import monitor_common  # noqa: E402
 from monitor_common import (  # noqa: E402
@@ -49,7 +50,7 @@ from monitor_common import (  # noqa: E402
     shorten,
     split_message,
 )
-from watchlist_monitor import build_message, collapse_buys  # noqa: E402
+from watchlist_monitor import build_message, build_scanned_message, collapse_buys  # noqa: E402
 from daily_summary import (  # noqa: E402
     build_digest,
     build_digest_batch,
@@ -149,6 +150,65 @@ class CongressDryRunTest(unittest.TestCase):
                     mock.patch.object(congress_monitor, "fetch_index_years", return_value=rows):
                 congress_monitor.run(args)
             self.assertFalse(state_path.exists())
+
+
+class ScannedFilingTest(unittest.TestCase):
+    """About one PTR in seven is a scan of a paper form: published and complete, with no
+    text layer. It used to be announced as "contents not published yet", retried hourly
+    for a day, then reported as unreadable -- a day late and described as a fault."""
+
+    ROW = {"DocID": "9116376", "FilingType": "P", "Year": "2026", "FilingDate": "10/7/2026",
+           "Prefix": "Hon.", "First": "Rohit", "Last": "Khanna", "StateDst": "CA17"}
+
+    def test_page_breaks_only_is_a_scan_and_counts_its_pages(self):
+        self.assertEqual(scanned_page_count("\f" * 31), 31)
+        self.assertEqual(scanned_page_count(" \n\f\n"), 1)
+
+    def test_missing_or_readable_text_is_not_a_scan(self):
+        # None/"" is the publish gap, which keeps its announce-and-wait handling.
+        for text in (None, "", "Hon. Rohit Khanna\fP 01/02/2026 02/01/2026 $1,001 -"):
+            self.assertEqual(scanned_page_count(text), 0, repr(text))
+
+    def test_monitor_links_a_scan_at_once_and_marks_it_handled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "seen.json"
+            save_alert_state(state_path, AlertState(seen={"older"}))
+            args = mock.Mock(dry_run=False, verbose=False, max_alerts=25, pending_grace=24,
+                             all_assets=False)
+            sent = []
+            with mock.patch.object(congress_monitor, "STATE_PATH", state_path), \
+                    mock.patch.object(congress_monitor, "fetch_index_years",
+                                      return_value=[self.ROW]), \
+                    mock.patch.object(congress_monitor, "fetch_ptr_text",
+                                      return_value="\f" * 31), \
+                    mock.patch.object(congress_monitor, "load_webhook_url",
+                                      return_value="https://hook"), \
+                    mock.patch.object(congress_monitor, "send_discord_message",
+                                      side_effect=lambda url, text: sent.append(text)):
+                congress_monitor.run(args)
+            state = load_alert_state(state_path)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("31-page scan", sent[0])
+        self.assertNotIn("not published yet", sent[0])
+        self.assertNotIn("could not be read", sent[0])
+        self.assertIn("9116376", state.seen)
+        self.assertEqual(state.pending, {})
+
+    def test_watchlist_alert_says_a_scan_may_hold_a_buy(self):
+        member = {"member": "Hon. Rohit Khanna", "state_dist": "CA17", "rank": 2}
+        msg = build_scanned_message(member, self.ROW, 31, 10)
+        self.assertIn("31-page scan", msg)
+        self.assertIn("may or may not contain a buy", msg)
+
+    def test_digest_lists_a_scan_as_a_scan_not_a_failure(self):
+        entry = {"member": {"member": "Hon. Rohit Khanna", "state_dist": "CA17", "rank": 2},
+                 "doc_id": "9116376", "pdf_link": "https://x/9116376.pdf",
+                 "unreadable": False, "scanned_pages": 31, "txn_count": 0,
+                 "summary": summarise_filing([])}
+        msg = build_digest(datetime(2026, 10, 8, tzinfo=timezone.utc), [entry],
+                           "est. alpha", 50, 50)
+        self.assertIn("31-page scan", msg)
+        self.assertNotIn("could not be read", msg)
 
 
 class RunLockTest(unittest.TestCase):

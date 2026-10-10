@@ -17,6 +17,7 @@ from house_disclosures import (
     format_filer_name,
     index_years,
     parse_transactions,
+    scanned_page_count,
 )
 from monitor_common import (
     LATE_LEGEND,
@@ -35,6 +36,7 @@ from monitor_common import (
     plural,
     run_lock,
     save_alert_state,
+    scanned_note,
     seed_baseline,
     send_discord_message,
 )
@@ -102,6 +104,18 @@ def build_landed_message(row: dict) -> str:
     ])
 
 
+def build_scanned_message(row: dict, pages: int) -> str:
+    """A filing made on paper: complete and published, but a scan, so there are no
+    transactions to list. Said once and immediately -- waiting a grace period for text
+    that cannot appear would only delay it a day and then misreport it as unreadable."""
+    name = escape_markdown(format_filer_name(row))
+    return "\n".join([
+        f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure",
+        f"Filed {row.get('FilingDate', '?')} · {scanned_note(pages)}",
+        PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
+    ])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
@@ -155,15 +169,26 @@ def run(args) -> None:
         print(f"-- {len(new_rows)} new PTR(s) to alert on, {len(state.pending)} awaiting "
               f"a PDF --")
 
-    sent = announced = skipped = waiting = 0
+    sent = announced = skipped = waiting = scanned = 0
     for row in new_rows:
         doc_id = row["DocID"]
+        pdf_text = None
         try:
             pdf_text = fetch_ptr_text(row["Year"], doc_id)
             transactions = parse_transactions(pdf_text) if pdf_text else []
         except Exception as exc:
             print(f"Failed to fetch/parse PDF {doc_id}: {exc}", file=sys.stderr)
             transactions = []
+
+        pages = scanned_page_count(pdf_text)
+        if pages:
+            if not deliver(build_scanned_message(row, pages), doc_id, webhook_url, args):
+                continue
+            scanned += 1
+            state.pending.pop(doc_id, None)
+            state.seen.add(doc_id)
+            persist()
+            continue
 
         if not transactions:
             action = pdf_wait_action(doc_id, state.pending, now, args.pending_grace)
@@ -214,6 +239,7 @@ def run(args) -> None:
         + (f" {announced} filing(s) announced ahead of their PDF." if announced else "")
         + (f" {waiting} still awaiting a PDF." if waiting else "")
         + (f" {skipped} had no stock transactions." if skipped else "")
+        + (f" {scanned} scanned paper filing(s) linked without contents." if scanned else "")
         + (f" {backlog} deferred." if backlog else ""))
 
 
