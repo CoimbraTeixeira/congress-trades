@@ -444,6 +444,27 @@ while two same-surname members in different districts stay apart — and the ext
 cache, where a cached filing is not re-fetched and a 404 or an unreadable PDF is never
 cached, so a transient failure cannot become permanent.
 
+## CI and merging
+
+`master` is protected: a change lands only through a pull request, and only after the
+`check` job in `.github/workflows/ci.yml` passes. The rule applies to admins too, so
+nothing — a person or a coding agent — can push straight to `master`. The cron jobs run
+from the local checkout and are unaffected.
+
+`check` runs three gates; the same commands work locally:
+
+```bash
+python3 hooks/pre-commit --all     # secret scan over every tracked file
+ruff check .                       # syntax errors + pyflakes; rules in ruff.toml
+python3 -m unittest discover -s tests
+```
+
+The secret scan runs in CI as well as locally because the local hook is opt-in per clone
+and `--no-verify` skips it; the CI copy is the one nothing can bypass. The lint rules are
+deliberately narrow — undefined names, unused imports, syntax errors — so the gate
+catches defects rather than demanding reformatting. CI installs only `requirements.txt`;
+the search tests do not need the optional embedding stack.
+
 ## Reading the numbers
 
 Every figure is an **estimate**, and the estimate is loose by construction. The
