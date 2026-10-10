@@ -38,7 +38,6 @@ import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
@@ -59,9 +58,9 @@ from house_disclosures import (
     scanned_page_count,
     trade_transactions,
 )
+from monitor_common import LEADERBOARD_PATH
 
-REPO_DIR = Path(__file__).resolve().parent
-OUTPUT_PATH = REPO_DIR / "leaderboard.json"
+OUTPUT_PATH = LEADERBOARD_PATH
 PRICE_BATCH_SIZE = 200
 FETCH_WORKERS = 8
 

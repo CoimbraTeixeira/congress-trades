@@ -8,11 +8,12 @@ chance to break the page.
 
 import json
 import sys
-from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent
-DATA_PATH = REPO_DIR / "leaderboard.json"
-OUTPUT_PATH = REPO_DIR / "dashboard.html"
+from house_disclosures import DATA_DIR
+from monitor_common import LEADERBOARD_PATH
+
+DATA_PATH = LEADERBOARD_PATH
+OUTPUT_PATH = DATA_DIR / "dashboard.html"
 DATA_SENTINEL = "/*__LEADERBOARD_DATA__*/null"
 
 TEMPLATE = """<!doctype html>

@@ -7,6 +7,9 @@ index years the monitor fetches, being baselined away when its member joins the
 watchlist, or being read as "no purchases" when it was actually unreadable.
 """
 
+import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -314,6 +317,140 @@ class RunLockTest(unittest.TestCase):
     def test_different_monitors_do_not_block_each_other(self):
         with run_lock("congress_monitor"), run_lock("watchlist_monitor"):
             pass
+
+
+class WebhookUrlTest(unittest.TestCase):
+    """The config is checked before anything posts. A loopback fake is let through so the
+    monitors can run end to end against it; anything else that isn't Discord is not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = Path(self.tmp.name) / "config.json"
+        patcher = mock.patch.object(monitor_common, "CONFIG_PATH", self.config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def load(self, url):
+        self.config.write_text(json.dumps({"webhook_url": url}))
+        return monitor_common.load_webhook_url()
+
+    def test_discord_webhooks_are_accepted(self):
+        for url in ("https://discord.com/api/webhooks/1/abc",
+                    "https://discordapp.com/api/webhooks/1/abc"):
+            self.assertEqual(self.load(url), url)
+
+    def test_a_loopback_fake_is_accepted(self):
+        for url in ("http://127.0.0.1:8123/api/webhooks/1/abc",
+                    "http://localhost:8123/api/webhooks/1/abc",
+                    "http://127.0.0.1/api/webhooks/1/abc"):
+            self.assertEqual(self.load(url), url)
+
+    def test_a_remote_host_is_rejected_even_with_the_webhook_path(self):
+        for url in ("http://example.com/api/webhooks/1/abc",
+                    "https://example.com/api/webhooks/1/abc",
+                    "http://127.0.0.1.example.com/api/webhooks/1/abc",
+                    "http://localhost@example.com/api/webhooks/1/abc",
+                    "http://10.0.0.5:8123/api/webhooks/1/abc"):
+            with self.assertRaises(SystemExit, msg=url):
+                self.load(url)
+
+    def test_loopback_needs_plain_http_and_the_webhook_path(self):
+        for url in ("https://127.0.0.1:8123/api/webhooks/1/abc",
+                    "http://127.0.0.1:8123/other/1/abc",
+                    "ftp://localhost/api/webhooks/1/abc"):
+            with self.assertRaises(SystemExit, msg=url):
+                self.load(url)
+
+
+# Imports every script in a fresh interpreter and reports the paths and URLs it resolved.
+# The seams are read at import time, so a subprocess is the only honest way to see what a
+# given environment produces -- reloading modules here would leak into the other tests.
+SEAM_PROBE = """
+import json
+import build_dashboard, build_leaderboard, build_search_index, build_watchlist
+import congress_monitor, daily_summary, house_disclosures, monitor_common
+import search_common, watchlist_monitor
+print(json.dumps({
+    "index_url": house_disclosures.INDEX_URL_TMPL,
+    "pdf_url": house_disclosures.PDF_URL_TMPL,
+    "ptr_cache": str(house_disclosures.PTR_TEXT_CACHE_DIR),
+    "config": str(monitor_common.CONFIG_PATH),
+    "state_dir": str(monitor_common.STATE_DIR),
+    "congress_state": str(congress_monitor.STATE_PATH),
+    "watchlist_state": str(watchlist_monitor.STATE_PATH),
+    "summary_state": str(daily_summary.STATE_PATH),
+    "leaderboard": sorted({str(p) for p in (
+        monitor_common.LEADERBOARD_PATH, daily_summary.LEADERBOARD_PATH,
+        build_leaderboard.OUTPUT_PATH, build_watchlist.LEADERBOARD_PATH,
+        build_dashboard.DATA_PATH, build_search_index.LEADERBOARD_PATH)}),
+    "watchlist": sorted({str(p) for p in (
+        monitor_common.WATCHLIST_PATH, watchlist_monitor.WATCHLIST_PATH,
+        build_watchlist.WATCHLIST_PATH)}),
+    "dashboard": str(build_dashboard.OUTPUT_PATH),
+    "index_db": str(search_common.INDEX_PATH),
+    "ticker_meta": str(search_common.META_PATH),
+}))
+"""
+SEAM_VARS = ("MONITOR_CONFIG", "HOUSE_CLERK_BASE_URL", "CONGRESS_TRADES_DATA_DIR")
+REPO = Path(__file__).resolve().parent.parent
+
+
+def probe_seams(**overrides) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in SEAM_VARS}
+    env.update(overrides)
+    out = subprocess.run([sys.executable, "-c", SEAM_PROBE], cwd=REPO, env=env,
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+class EnvironmentSeamTest(unittest.TestCase):
+    """Each override exists so a run against fake services can't reach the live archive,
+    the real channel or the cron's state. Unset, every path and URL must be exactly what
+    it was before the seams existed -- the hourly cron runs with none of them set."""
+
+    def expected(self, data: Path, clerk: str, config: Path) -> dict:
+        return {
+            "index_url": clerk + "/public_disc/financial-pdfs/{year}FD.zip",
+            "pdf_url": clerk + "/public_disc/ptr-pdfs/{year}/{doc_id}.pdf",
+            "ptr_cache": str(data / "cache" / "ptr_text"),
+            "config": str(config),
+            "state_dir": str(data / "state"),
+            "congress_state": str(data / "state" / "seen_docids.json"),
+            "watchlist_state": str(data / "state" / "watchlist_seen_docids.json"),
+            "summary_state": str(data / "state" / "summary_seen_docids.json"),
+            "leaderboard": [str(data / "leaderboard.json")],
+            "watchlist": [str(data / "watchlist.json")],
+            "dashboard": str(data / "dashboard.html"),
+            "index_db": str(data / "trades_index.db"),
+            "ticker_meta": str(data / "ticker_meta.json"),
+        }
+
+    def test_unset_means_the_repo_dir_the_real_clerk_and_the_shared_config(self):
+        self.assertEqual(probe_seams(), self.expected(
+            REPO, "https://disclosures-clerk.house.gov",
+            Path.home() / ".config" / "fare-monitor" / "config.json"))
+
+    def test_empty_values_count_as_unset(self):
+        self.assertEqual(
+            probe_seams(**{name: "" for name in SEAM_VARS}),
+            self.expected(REPO, "https://disclosures-clerk.house.gov",
+                          Path.home() / ".config" / "fare-monitor" / "config.json"))
+
+    def test_overrides_move_every_generated_file_and_the_clerk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory).resolve() / "data"
+            config = Path(directory) / "config.json"
+            got = probe_seams(CONGRESS_TRADES_DATA_DIR=str(data),
+                              HOUSE_CLERK_BASE_URL="http://127.0.0.1:8123/clerk/",
+                              MONITOR_CONFIG=str(config))
+        self.assertEqual(got, self.expected(data, "http://127.0.0.1:8123/clerk", config))
+
+    def test_a_relative_data_dir_is_pinned_to_an_absolute_path(self):
+        # cron and a test harness rarely share a cwd; resolving once at import means a
+        # script that chdirs later still writes where the override pointed.
+        got = probe_seams(CONGRESS_TRADES_DATA_DIR="sandbox")
+        self.assertEqual(got["state_dir"], str(REPO / "sandbox" / "state"))
 
 
 def txn(**kwargs):

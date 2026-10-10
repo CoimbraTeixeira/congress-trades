@@ -409,6 +409,36 @@ monitors simply run without theme lines. The rebuild writes to a staging store a
 into place only on success, so a failure leaves the previous index serving rather than
 deleting it and failing before the replacement is written.
 
+## Running against fakes
+
+Three environment variables let the whole pipeline run against local fakes of its
+outside services (the `factory` repo's `fakes/` server and sandbox) — so a scenario test
+can exercise the real code with no request to the Clerk, no post to the real channel,
+and no write to this checkout's state. Each is opt-in: **unset (or empty), behaviour is
+exactly what it was before** — same URLs, same paths — which is how the cron jobs run.
+
+| Variable | Default | Overrides |
+|---|---|---|
+| `HOUSE_CLERK_BASE_URL` | `https://disclosures-clerk.house.gov` | Where the index ZIPs and PTR PDFs are fetched from, and the PDF link alerts print. A trailing slash is ignored. |
+| `CONGRESS_TRADES_DATA_DIR` | this repo's directory | The base for everything generated or mutated: `state/`, `cache/ptr_text/`, `leaderboard.json`, `watchlist.json`, `ticker_meta.json`, `trades_index.db`, `dashboard.html`. |
+| `MONITOR_CONFIG` | `~/.config/fare-monitor/config.json` | The webhook config file. |
+
+The webhook check still refuses anything that isn't a Discord webhook, with one exception
+for a fake: plain `http` to `127.0.0.1` or `localhost` with a path under `/api/webhooks/`.
+A remote host is rejected whatever its path, so the exception can't route alerts off the
+machine.
+
+```bash
+HOUSE_CLERK_BASE_URL=http://127.0.0.1:8123/clerk \
+CONGRESS_TRADES_DATA_DIR=/tmp/ct-sandbox \
+MONITOR_CONFIG=/tmp/ct-sandbox/config.json \
+python3 congress_monitor.py
+```
+
+`state/` and `cache/` are created inside it as needed, but create the data directory
+itself first. The scripts that read the leaderboard or watchlist expect them there — copy
+a recorded one in, or run the build scripts with the same variables first.
+
 ## Tests
 
 ```bash
@@ -427,7 +457,9 @@ machine (announce once, wait silently, give up after the grace period, and resol
 corrupt or naive timestamp rather than retrying forever), scanned paper filings linked
 at once rather than entering that wait, strict state shape validation with both legacy
 formats, dry-run immutability, digest overflow deferral, and the run lock releasing on
-both a clean exit and a crash.
+both a clean exit and a crash. It also pins the fake-service seams: with the variables
+unset every path and URL is the pre-seam one, set they move every generated file, and the
+webhook check admits a loopback fake but no other non-Discord host.
 
 `tests/test_leaderboard.py` covers the scoring and accounting engine: the FIFO matcher,
 price lookup boundaries, benchmark comparison, all-asset traded volume, failed-PTR

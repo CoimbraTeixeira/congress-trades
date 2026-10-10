@@ -7,7 +7,6 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
@@ -30,6 +29,7 @@ from monitor_common import (
     PDF_GIVE_UP,
     PDF_WAIT,
     STATE_DIR,
+    WATCHLIST_PATH,
     add_common_args,
     any_late,
     baseline_docids,
@@ -48,8 +48,6 @@ from monitor_common import (
 )
 from search_common import THEME_SIMILARITY, ThemeIndex
 
-REPO_DIR = Path(__file__).resolve().parent
-WATCHLIST_PATH = REPO_DIR / "watchlist.json"
 STATE_PATH = STATE_DIR / "watchlist_seen_docids.json"
 
 
