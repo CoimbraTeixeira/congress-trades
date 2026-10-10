@@ -11,10 +11,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 
 from house_disclosures import (
+    DATA_DIR,
     LATE_FILING_DAYS,
     clean_asset_name,
     filing_delay_days,
@@ -23,10 +25,18 @@ from house_disclosures import (
     parse_date,
 )
 
-REPO_DIR = Path(__file__).resolve().parent
-STATE_DIR = REPO_DIR / "state"
-CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # shared with fare-monitor
-LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
+STATE_DIR = DATA_DIR / "state"
+LEADERBOARD_PATH = DATA_DIR / "leaderboard.json"
+WATCHLIST_PATH = DATA_DIR / "watchlist.json"
+# Shared with fare-monitor. MONITOR_CONFIG points a sandboxed run at a config holding a
+# fake webhook, so a test can never post to the real channel by accident.
+CONFIG_PATH = Path(os.environ.get("MONITOR_CONFIG")
+                   or Path.home() / ".config" / "fare-monitor" / "config.json").expanduser()
+
+# The one non-Discord webhook load_webhook_url accepts: a local fake server, for running
+# the monitors end to end without a real channel. Loopback only, so a typo'd or hostile
+# config still can't send alerts anywhere but Discord or this machine.
+LOOPBACK_WEBHOOK_HOSTS = {"127.0.0.1", "localhost"}
 
 # How many of the best-ranked members an alert calls out as top performers. Matches
 # build_watchlist.py's default, so the 🏆 marks exactly the members watchlist_monitor
@@ -64,6 +74,23 @@ def log(message: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] {message}")
 
 
+def is_discord_webhook(url: str) -> bool:
+    return "discord.com/api/webhooks/" in url or "discordapp.com/api/webhooks/" in url
+
+
+def is_loopback_webhook(url: str) -> bool:
+    """True for a fake Discord webhook on this machine: plain http to 127.0.0.1 or
+    localhost, with Discord's /api/webhooks/ path shape. Anything remote is refused even
+    with the right path -- the exception is for local fakes, not other services."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return False
+    return (parts.scheme == "http" and host in LOOPBACK_WEBHOOK_HOSTS
+            and parts.path.startswith("/api/webhooks/"))
+
+
 def load_webhook_url() -> str:
     if not CONFIG_PATH.exists():
         sys.exit(f"Missing config file: {CONFIG_PATH}")
@@ -74,7 +101,7 @@ def load_webhook_url() -> str:
     url = config.get("webhook_url")
     if not url:
         sys.exit(f"No 'webhook_url' key in {CONFIG_PATH}")
-    if "discord.com/api/webhooks/" not in url and "discordapp.com/api/webhooks/" not in url:
+    if not is_discord_webhook(url) and not is_loopback_webhook(url):
         # A webhook from somewhere else would fail as an opaque 400 from Discord.
         # Naming the config is the difference between a one-line fix and an evening.
         sys.exit(

@@ -15,11 +15,8 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent
-LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
-WATCHLIST_PATH = REPO_DIR / "watchlist.json"
+from monitor_common import LEADERBOARD_PATH, WATCHLIST_PATH
 
 
 def main() -> None:

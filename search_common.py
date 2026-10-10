@@ -22,9 +22,10 @@ what lets the cron monitors add theme context without pulling torch into an aler
 
 from pathlib import Path
 
-REPO_DIR = Path(__file__).resolve().parent
-INDEX_PATH = REPO_DIR / "trades_index.db"          # Milvus Lite store (a directory)
-META_PATH = REPO_DIR / "ticker_meta.json"          # ticker -> {name, sector, industry, summary}
+from house_disclosures import DATA_DIR
+
+INDEX_PATH = DATA_DIR / "trades_index.db"          # Milvus Lite store (a directory)
+META_PATH = DATA_DIR / "ticker_meta.json"          # ticker -> {name, sector, industry, summary}
 TICKERS = "tickers"
 POSITIONS = "positions"
 

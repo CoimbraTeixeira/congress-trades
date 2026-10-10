@@ -37,12 +37,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from house_disclosures import parse_date
-from monitor_common import display_name
+from monitor_common import LEADERBOARD_PATH, display_name
 from search_common import (EMBED_DIM, INDEX_PATH, META_PATH, METRIC, POSITIONS, TICKERS,
                            embed_documents, open_client, truncate_bytes)
 
-REPO_DIR = Path(__file__).resolve().parent
-LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
 FETCH_WORKERS = 8
 INSERT_BATCH = 500
 
@@ -271,7 +269,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--leaderboard", type=Path, default=LEADERBOARD_PATH,
-                        help="path to leaderboard.json (default: alongside this script)")
+                        help="path to leaderboard.json (default: in the data directory)")
     parser.add_argument("--refresh-meta", action="store_true",
                         help="re-fetch every ticker's company/sector/description")
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress")

@@ -17,7 +17,6 @@ import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
@@ -38,6 +37,7 @@ from house_disclosures import (
 )
 from monitor_common import (
     DEFAULT_BASELINE_WINDOW_DAYS,
+    LEADERBOARD_PATH,
     PDF_GIVE_UP,
     STATE_DIR,
     add_all_assets_arg,
@@ -62,8 +62,6 @@ from monitor_common import (
 )
 from search_common import ThemeIndex
 
-REPO_DIR = Path(__file__).resolve().parent
-LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
 STATE_PATH = STATE_DIR / "summary_seen_docids.json"
 
 DEFAULT_TOP = 50

@@ -22,8 +22,23 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 HEADERS = {"User-Agent": "congress-trade-monitor/1.0"}
-INDEX_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
-PDF_URL_TMPL = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+
+# Both overrides exist so the whole pipeline can run against a local fake of the Clerk's
+# site and a throwaway data directory (see "Running against fakes" in the README) without
+# touching the live archive or the hourly cron's state. Unset, they are exactly the real
+# site and this checkout -- every other module derives its paths and URLs from these two.
+HOUSE_CLERK_BASE_URL = (os.environ.get("HOUSE_CLERK_BASE_URL")
+                        or "https://disclosures-clerk.house.gov").rstrip("/")
+INDEX_URL_TMPL = HOUSE_CLERK_BASE_URL + "/public_disc/financial-pdfs/{year}FD.zip"
+PDF_URL_TMPL = HOUSE_CLERK_BASE_URL + "/public_disc/ptr-pdfs/{year}/{doc_id}.pdf"
+
+# Where everything the scripts generate or mutate lives: state/, cache/, the leaderboard,
+# watchlist, dashboard and search index. Defined once, here in the lowest-level module, so
+# no script can quietly write beside the code while the rest honour the override.
+REPO_DIR = Path(__file__).resolve().parent
+_data_dir_override = os.environ.get("CONGRESS_TRADES_DATA_DIR")
+DATA_DIR = Path(_data_dir_override).expanduser().resolve() if _data_dir_override else REPO_DIR
+
 PTR_FILING_TYPE = "P"
 
 # Filers must report within 45 days of the transaction (STOCK Act, 5 U.S.C. app. 101).
@@ -42,7 +57,7 @@ PERFORMANCE_WINDOW_YEARS = 3
 # filing never changes, and the performance window re-reads a few thousand PTRs on every
 # rebuild; without the cache that is a few thousand downloads plus pdftotext runs a day
 # against the Clerk's site for text that cannot have moved.
-PTR_TEXT_CACHE_DIR = Path(__file__).resolve().parent / "cache" / "ptr_text"
+PTR_TEXT_CACHE_DIR = DATA_DIR / "cache" / "ptr_text"
 _SAFE_DOC_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 # House asset-type codes (fd.house.gov/reference/asset-type-codes.aspx) that denote
