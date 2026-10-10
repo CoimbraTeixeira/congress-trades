@@ -85,6 +85,26 @@ the end of a long legal name. Buys are grouped before sells, since the PDF's row
 however the filer's broker listed them. `⏰` marks a late disclosure and carries the days
 taken; the deadline it missed is stated once at the foot rather than in every line.
 
+### Top performers are flagged
+
+When the filer is one of the **10 best-ranked members by estimated alpha** on the
+leaderboard, the alert says so directly under the name:
+
+```
+🗳️ **Hon. Nancy Pelosi** (CA11) — new trade disclosure
+🏆 Top performer · #3 of 58 · +73.4% est. return vs +26.4% SPY (+47.0% alpha) · 3-year record
+```
+
+A sale by someone with a strong record is a different signal from the same sale by
+anyone else, and the reader decides on the first two lines. The ranking is alpha — the
+leaderboard's own metric, see *Reading the numbers* — but the line leads with the raw
+return, since that is what a reader asks about, and keeps the index beside it because
++73% means little until you know SPY did +26% over the same holdings. Only members who
+clear the leaderboard's `--min-trades`/`--min-invested` thresholds can qualify, so one
+lucky trade never earns the flag. The 10 match `build_watchlist.py`'s default, so 🏆 marks
+exactly the members the watchlist monitor watches. A missing or unreadable
+`leaderboard.json` drops the line, never the alert.
+
 ## Stocks only
 
 **Every alert covers stocks and stock options only.** A PTR discloses a member's whole
@@ -267,7 +287,9 @@ artefacts.
 a roll-up of tickers more than one member touched, then a per-member buy/sell breakdown
 with PDF links. One digest is capped at three Discord messages; whole filings that do not
 fit remain unseen for the next run. Where the two monitors alert per filing as it lands,
-this is the once-a-day read across the wider field.
+this is the once-a-day read across the wider field. The same top-10 members carry a 🏆
+before their name here too, explained once at the foot, whichever `--rank-by` chose the
+digest's coverage.
 
 ```bash
 python3 daily_summary.py --top 50                  # default: ranked by alpha

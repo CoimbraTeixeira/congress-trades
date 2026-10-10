@@ -26,6 +26,12 @@ from house_disclosures import (
 REPO_DIR = Path(__file__).resolve().parent
 STATE_DIR = REPO_DIR / "state"
 CONFIG_PATH = Path.home() / ".config" / "fare-monitor" / "config.json"  # shared with fare-monitor
+LEADERBOARD_PATH = REPO_DIR / "leaderboard.json"
+
+# How many of the best-ranked members an alert calls out as top performers. Matches
+# build_watchlist.py's default, so the 🏆 marks exactly the members watchlist_monitor
+# watches -- one meaning for the mark, wherever it appears.
+TOP_PERFORMERS = 10
 
 # A run that would post more than this many alerts is almost certainly a state-file
 # problem rather than a real burst of filings. The excess is left unseen so the next
@@ -331,6 +337,85 @@ def display_name(member: dict) -> str:
     if last and first:
         return f"{last}, {first}"
     return last or first or (member.get("member") or "").strip()
+
+
+def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
+    """Leaderboard members in rank order, best first.
+
+    `alpha` ranks by estimated return less what the benchmark did over the same holding
+    windows -- the default, because a raw return in a rising market ranks whoever held
+    the most beta above whoever picked well. `return` ranks by the raw figure. Both are
+    only defined for members who clear the leaderboard's thresholds. `volume` ranks
+    every filer by all in-window buys and sells, including non-equity assets.
+    """
+    members = leaderboard["members"]
+    if rank_by == "alpha":
+        pool = [m for m in members
+                if m.get("ranked") and m.get("alpha_pct_estimate") is not None]
+        key = lambda m: m["alpha_pct_estimate"]  # noqa: E731
+    elif rank_by == "return":
+        pool = [m for m in members if m.get("ranked")]
+        key = lambda m: m["return_pct_estimate"]  # noqa: E731
+    else:
+        pool = members
+        key = lambda m: m["traded_total_estimate"]  # noqa: E731
+    return sorted(pool, key=key, reverse=True)[:top]
+
+
+def top_performers_by_key(leaderboard: dict, top: int = TOP_PERFORMERS) -> dict[tuple, dict]:
+    """The best `top` members by estimated alpha, keyed by member_key.
+
+    Each value is the leaderboard entry plus `top_rank`, `ranked_count` (the size of the
+    field the rank is out of) and `window_years`, which is everything the 🏆 line needs.
+    """
+    ranked = select_members(leaderboard, len(leaderboard.get("members", [])), "alpha")
+    extra = {"ranked_count": len(ranked), "window_years": leaderboard.get("window_years")}
+    return {
+        tuple(m["member_key"]): dict(m, top_rank=rank, **extra)
+        for rank, m in enumerate(ranked[:top], start=1)
+        if m.get("member_key")
+    }
+
+
+def load_top_performers(path: Path | None = None) -> dict[tuple, dict]:
+    """top_performers_by_key() from leaderboard.json, or {} if it cannot be read.
+
+    The flag is context on an alert, never a reason for one to fail: a missing or
+    malformed leaderboard costs the 🏆 line and nothing else."""
+    try:
+        return top_performers_by_key(json.loads((path or LEADERBOARD_PATH).read_text()))
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def top_performer_scope(member: dict) -> str:
+    """What the 🏆 means, stated once: which ranking, out of how many, over what span."""
+    years = member.get("window_years")
+    span = f" over {years} years" if years else ""
+    return (f"top {TOP_PERFORMERS} of {member['ranked_count']} ranked members by "
+            f"estimated alpha vs the index{span}")
+
+
+def top_performer_line(member: dict) -> str:
+    """`🏆 Top performer · #3 of 58 · +73.4% est. return vs +26.4% SPY (+47.0% alpha)`.
+
+    The return leads because that is the figure a reader asks about, but never alone:
+    +20% is a good three years or a bad one depending on what the index did."""
+    parts = [f"🏆 Top performer · #{member['top_rank']} of {member['ranked_count']}"]
+    ret = member.get("return_pct_estimate")
+    bench = member.get("benchmark_return_pct_estimate")
+    alpha = member.get("alpha_pct_estimate")
+    if ret is not None:
+        perf = f"{ret:+.1f}% est. return"
+        if bench is not None:
+            perf += f" vs {bench:+.1f}% {member.get('benchmark_ticker') or 'index'}"
+        if alpha is not None:
+            perf += f" ({alpha:+.1f}% alpha)"
+        parts.append(perf)
+    years = member.get("window_years")
+    if years:
+        parts.append(f"{years}-year record")
+    return " · ".join(parts)
 
 
 def compact_dollars(value: float) -> str:

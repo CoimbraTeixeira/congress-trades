@@ -16,6 +16,7 @@ from house_disclosures import (
     filing_sort_key,
     format_filer_name,
     index_years,
+    member_key,
     parse_transactions,
     scanned_page_count,
 )
@@ -30,6 +31,7 @@ from monitor_common import (
     escape_markdown,
     format_transaction,
     load_alert_state,
+    load_top_performers,
     load_webhook_url,
     log,
     pdf_wait_action,
@@ -39,6 +41,7 @@ from monitor_common import (
     scanned_note,
     seed_baseline,
     send_discord_message,
+    top_performer_line,
 )
 
 STATE_PATH = STATE_DIR / "seen_docids.json"
@@ -49,12 +52,24 @@ STATE_PATH = STATE_DIR / "seen_docids.json"
 DIRECTION_ORDER = {"Purchase": 0, "Sale": 1, "Exchange": 2}
 
 
-def build_message(row: dict, transactions: list[dict]) -> str:
+def header(row: dict, title: str, top: dict | None) -> list[str]:
+    """Who filed, then -- for a top performer -- why that member is worth reading.
+
+    The flag sits directly under the name because it changes how the rest is read: a
+    sale by someone with a strong record is a different signal from the same sale by
+    anyone else, and a reader scanning a channel of these decides on the first lines."""
+    name = escape_markdown(format_filer_name(row))
+    lines = [f"🗳️ **{name}** ({row.get('StateDst', '?')}) — {title}"]
+    if top:
+        lines.append(top_performer_line(top))
+    return lines
+
+
+def build_message(row: dict, transactions: list[dict], top: dict | None = None) -> str:
     filing_date = row.get("FilingDate", "?")
     pdf_link = PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"])
-    name = escape_markdown(format_filer_name(row))
     # Who filed leads: in a channel of these, the member is what a reader scans for.
-    lines = [f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure"]
+    lines = header(row, "new trade disclosure", top)
 
     if not transactions:
         # An unreadable PDF is not an empty filing, and the alert has to say which. This
@@ -87,7 +102,7 @@ def build_message(row: dict, transactions: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_landed_message(row: dict) -> str:
+def build_landed_message(row: dict, top: dict | None = None) -> str:
     """The index-row-first alert: the filing exists, its PDF does not yet.
 
     Worth sending on its own because the row appears in the archive before the document
@@ -95,22 +110,20 @@ def build_landed_message(row: dict) -> str:
     minutes after it is indexed beats saying nothing until the PDF publishes, and the
     transactions follow as a second alert once they can be read.
     """
-    name = escape_markdown(format_filer_name(row))
     return "\n".join([
-        f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure filed",
+        *header(row, "new trade disclosure filed", top),
         f"Filed {row.get('FilingDate', '?')} · contents not published yet; "
         f"the transactions will follow when the PDF appears",
         PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
     ])
 
 
-def build_scanned_message(row: dict, pages: int) -> str:
+def build_scanned_message(row: dict, pages: int, top: dict | None = None) -> str:
     """A filing made on paper: complete and published, but a scan, so there are no
     transactions to list. Said once and immediately -- waiting a grace period for text
     that cannot appear would only delay it a day and then misreport it as unreadable."""
-    name = escape_markdown(format_filer_name(row))
     return "\n".join([
-        f"🗳️ **{name}** ({row.get('StateDst', '?')}) — new trade disclosure",
+        *header(row, "new trade disclosure", top),
         f"Filed {row.get('FilingDate', '?')} · {scanned_note(pages)}",
         PDF_URL_TMPL.format(year=row["Year"], doc_id=row["DocID"]),
     ])
@@ -169,9 +182,11 @@ def run(args) -> None:
         print(f"-- {len(new_rows)} new PTR(s) to alert on, {len(state.pending)} awaiting "
               f"a PDF --")
 
+    top_performers = load_top_performers()
     sent = announced = skipped = waiting = scanned = 0
     for row in new_rows:
         doc_id = row["DocID"]
+        top = top_performers.get(member_key(row))
         pdf_text = None
         try:
             pdf_text = fetch_ptr_text(row["Year"], doc_id)
@@ -182,7 +197,7 @@ def run(args) -> None:
 
         pages = scanned_page_count(pdf_text)
         if pages:
-            if not deliver(build_scanned_message(row, pages), doc_id, webhook_url, args):
+            if not deliver(build_scanned_message(row, pages, top), doc_id, webhook_url, args):
                 continue
             scanned += 1
             state.pending.pop(doc_id, None)
@@ -198,8 +213,8 @@ def run(args) -> None:
                     print(f"{doc_id}: PDF still unreadable, announced "
                           f"{state.pending[doc_id]} — waiting")
                 continue
-            message = (build_landed_message(row) if action == PDF_ANNOUNCE
-                       else build_message(row, []))
+            message = (build_landed_message(row, top) if action == PDF_ANNOUNCE
+                       else build_message(row, [], top))
             if not deliver(message, doc_id, webhook_url, args):
                 continue
             if action == PDF_ANNOUNCE:
@@ -228,7 +243,7 @@ def run(args) -> None:
             persist()
             continue
 
-        if not deliver(build_message(row, alertable), doc_id, webhook_url, args):
+        if not deliver(build_message(row, alertable, top), doc_id, webhook_url, args):
             continue
         sent += 1
         state.seen.add(doc_id)

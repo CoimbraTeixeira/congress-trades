@@ -42,13 +42,17 @@ from monitor_common import (  # noqa: E402
     format_transaction,
     is_within_window,
     load_alert_state,
+    load_top_performers,
     pdf_wait_action,
     plural,
     run_lock,
     save_alert_state,
+    select_members,
     send_discord_message,
     shorten,
     split_message,
+    top_performer_line,
+    top_performers_by_key,
 )
 from watchlist_monitor import build_message, build_scanned_message, collapse_buys  # noqa: E402
 from daily_summary import (  # noqa: E402
@@ -56,7 +60,6 @@ from daily_summary import (  # noqa: E402
     build_digest_batch,
     format_side,
     most_traded,
-    select_members,
     summarise_filing,
 )
 
@@ -183,6 +186,8 @@ class ScannedFilingTest(unittest.TestCase):
                                       return_value="\f" * 31), \
                     mock.patch.object(congress_monitor, "load_webhook_url",
                                       return_value="https://hook"), \
+                    mock.patch.object(congress_monitor, "load_top_performers",
+                                      return_value={}), \
                     mock.patch.object(congress_monitor, "send_discord_message",
                                       side_effect=lambda url, text: sent.append(text)):
                 congress_monitor.run(args)
@@ -209,6 +214,70 @@ class ScannedFilingTest(unittest.TestCase):
                            "est. alpha", 50, 50)
         self.assertIn("31-page scan", msg)
         self.assertNotIn("could not be read", msg)
+
+
+class TopPerformerTest(unittest.TestCase):
+    """Every trade alert flags a member with one of the best records, so a reader can
+    tell a strong trader's move from anyone else's without opening the dashboard."""
+
+    @staticmethod
+    def member(name, alpha, ranked=True, district="XX01"):
+        return {"member": name, "member_key": [name.lower(), district], "ranked": ranked,
+                "alpha_pct_estimate": alpha, "return_pct_estimate": alpha + 25.0,
+                "benchmark_return_pct_estimate": 25.0, "benchmark_ticker": "SPY",
+                "traded_total_estimate": 1.0}
+
+    def board(self, members):
+        return {"window_years": 3, "members": members}
+
+    def test_top_n_by_alpha_with_rank_and_field_size(self):
+        members = [self.member(f"M{i}", float(i), district=f"XX{i:02d}") for i in range(15)]
+        top = top_performers_by_key(self.board(members), top=10)
+        self.assertEqual(len(top), 10)
+        self.assertEqual(top[("m14", "XX14")]["top_rank"], 1)
+        self.assertEqual(top[("m5", "XX05")]["top_rank"], 10)
+        self.assertNotIn(("m4", "XX04"), top)
+        self.assertEqual(top[("m14", "XX14")]["ranked_count"], 15)
+
+    def test_unranked_and_unbenchmarked_members_are_never_top(self):
+        # One lucky trade, or a return with no index to measure it against, is not a record.
+        board = self.board([self.member("Lucky", 500.0, ranked=False),
+                            self.member("Steady", 0.0, district="XX02"),
+                            dict(self.member("Unpriced", 9.0, district="XX03"),
+                                 alpha_pct_estimate=None)])
+        top = top_performers_by_key(board)
+        self.assertEqual(list(top), [("steady", "XX02")])
+        self.assertEqual(top[("steady", "XX02")]["ranked_count"], 1)
+
+    def test_line_quotes_return_against_the_index_and_the_span(self):
+        top = top_performers_by_key(self.board([self.member("Pelosi", 47.0)]))
+        line = top_performer_line(top[("pelosi", "XX01")])
+        self.assertEqual(line, "🏆 Top performer · #1 of 1 · +72.0% est. return vs "
+                               "+25.0% SPY (+47.0% alpha) · 3-year record")
+
+    def test_missing_leaderboard_costs_the_flag_not_the_alert(self):
+        self.assertEqual(load_top_performers(Path("/nonexistent/leaderboard.json")), {})
+
+    def test_trade_alert_flags_a_top_performer_under_the_name(self):
+        row = dict(ScannedFilingTest.ROW, DocID="20030001")
+        top = top_performers_by_key(self.board([self.member("Khanna", 47.0,
+                                                            district="CA17")]))
+        flagged = congress_monitor.build_message(row, [txn()], top[("khanna", "CA17")])
+        plain = congress_monitor.build_message(row, [txn()])
+        self.assertTrue(flagged.splitlines()[1].startswith("🏆 Top performer · #1 of 1"))
+        self.assertNotIn("🏆", plain)
+
+    def test_digest_marks_top_performers_and_explains_the_mark_once(self):
+        top = top_performers_by_key(self.board([self.member("Pelosi", 47.0)]))
+        entry = {"member": {"member": "Pelosi", "state_dist": "CA11", "rank": 1,
+                            "return_pct_estimate": 72.0, "alpha_pct_estimate": 47.0,
+                            "top": top[("pelosi", "XX01")]},
+                 "doc_id": "1", "pdf_link": "https://x/1.pdf", "unreadable": False,
+                 "scanned_pages": 0, "txn_count": 1, "summary": summarise_filing([txn()])}
+        msg = build_digest(datetime(2026, 10, 8, tzinfo=timezone.utc), [entry, entry],
+                           "est. alpha", 50, 50)
+        self.assertIn("🏆 **Pelosi**", msg)
+        self.assertEqual(msg.count("🏆 = top 10 of 1 ranked members"), 1)
 
 
 class RunLockTest(unittest.TestCase):

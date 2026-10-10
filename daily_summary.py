@@ -53,9 +53,12 @@ from monitor_common import (
     run_lock,
     save_alert_state,
     scanned_note,
+    select_members,
     send_discord_message,
     shorten,
     split_message,
+    top_performer_scope,
+    top_performers_by_key,
 )
 from search_common import ThemeIndex
 
@@ -76,29 +79,6 @@ FETCH_WORKERS = 6
 # An untickered asset (a bond, a fund) is labelled by name. Short enough to sit several
 # to a line, and cut on a word boundary so it reads as an abbreviation and not a bug.
 MAX_LABEL_CHARS = 22
-
-
-def select_members(leaderboard: dict, top: int, rank_by: str) -> list[dict]:
-    """The members whose filings this digest covers.
-
-    `alpha` ranks by estimated return less what the benchmark did over the same holding
-    windows -- the default, because a raw return in a rising market ranks whoever held
-    the most beta above whoever picked well. `return` ranks by the raw figure. Both are
-    only defined for members who clear the leaderboard's thresholds. `volume` ranks
-    every filer by all in-window buys and sells, including non-equity assets.
-    """
-    members = leaderboard["members"]
-    if rank_by == "alpha":
-        pool = [m for m in members
-                if m.get("ranked") and m.get("alpha_pct_estimate") is not None]
-        key = lambda m: m["alpha_pct_estimate"]  # noqa: E731
-    elif rank_by == "return":
-        pool = [m for m in members if m.get("ranked")]
-        key = lambda m: m["return_pct_estimate"]  # noqa: E731
-    else:
-        pool = members
-        key = lambda m: m["traded_total_estimate"]  # noqa: E731
-    return sorted(pool, key=key, reverse=True)[:top]
 
 
 def summarise_filing(transactions: list[dict]) -> dict:
@@ -168,7 +148,8 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
         # wherever the return is printed.
         if alpha is not None:
             ret_label += f" ({alpha:+.1f}% vs index)"
-        lines += ["", f"**{escape_markdown(member['member'])}** · "
+        top = member.get("top")
+        lines += ["", f"{'🏆 ' if top else ''}**{escape_markdown(member['member'])}** · "
                       f"{member['state_dist']} · #{member['rank']}{ret_label}",
                   entry["pdf_link"]]
         if summary["buys"]:
@@ -180,6 +161,9 @@ def build_digest(now: datetime, entries: list[dict], scope_label: str,
                          if entry.get("scanned_pages")
                          else "_(transactions could not be read from the PDF)_")
 
+    tops = [e["member"]["top"] for e in entries if e["member"].get("top")]
+    if tops:
+        lines += ["", f"_🏆 = {top_performer_scope(tops[0])}_"]
     return "\n".join(lines)
 
 
@@ -341,8 +325,12 @@ def run(args) -> None:
                  f"build_leaderboard.py.")
     # Matched on the leaderboard's normalized (surname, district) key, not the printed
     # name: the index spells the same filer differently from one archive to the next.
+    # The 🏆 marks the same top-by-alpha set the trade alerts flag, whatever --rank-by
+    # chose the digest's coverage, so the mark means one thing everywhere.
+    top_performers = top_performers_by_key(leaderboard)
     covered_by_key = {
-        tuple(m["member_key"]): dict(m, rank=rank)
+        tuple(m["member_key"]): dict(m, rank=rank,
+                                     top=top_performers.get(tuple(m["member_key"])))
         for rank, m in enumerate(top_members, start=1)
     }
 
